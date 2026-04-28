@@ -959,6 +959,14 @@ def _all_segments() -> list[tuple[int, int]]:
     return ranges
 
 
+def _segment_index_for_ea_or_next(segments: list[tuple[int, int]], ea: int) -> int:
+    """Return index of segment containing `ea`, or the first one strictly after it."""
+    for idx, (seg_start, seg_end) in enumerate(segments):
+        if ea < seg_end:
+            return idx
+    return len(segments)
+
+
 @tool
 @idasync
 def search_text(
@@ -1026,24 +1034,35 @@ def search_text(
 
     hits: list[SearchTextHit] = []
     next_cursor: int | None = None
-    seg_idx = 0
-    # Skip ahead to the segment that contains/follows cursor_ea.
-    while seg_idx < len(segments) and segments[seg_idx][1] <= cursor_ea:
-        seg_idx += 1
+    seg_idx = _segment_index_for_ea_or_next(segments, cursor_ea)
     if seg_idx < len(segments) and cursor_ea < segments[seg_idx][0]:
         cursor_ea = segments[seg_idx][0]
 
     while seg_idx < len(segments) and len(hits) < limit:
         seg_start, seg_end = segments[seg_idx]
         ea = ida_search.find_text(cursor_ea, 0, 0, pattern, sflag)
-        if ea == idaapi.BADADDR or ea >= seg_end:
-            seg_idx += 1
-            if seg_idx < len(segments):
-                cursor_ea = segments[seg_idx][0]
+        if ea == idaapi.BADADDR:
+            # find_text scans forward to the end of the IDB. A miss here means
+            # there cannot be any later hits, so avoid rescanning every segment tail.
+            break
+        if ea >= seg_end:
+            # find_text is not segment-bounded; jump directly to the segment that
+            # contains the hit (or the next segment after it) instead of rescanning
+            # each intermediate segment from scratch.
+            next_idx = _segment_index_for_ea_or_next(segments, ea)
+            if next_idx >= len(segments):
+                break
+            seg_idx = next_idx
+            next_start, _ = segments[seg_idx]
+            cursor_ea = ea if ea >= next_start else next_start
             continue
         if ea < seg_start:
-            # Match landed in a segment we already passed; skip.
-            cursor_ea = ea + 1
+            next_idx = _segment_index_for_ea_or_next(segments, ea)
+            if next_idx >= len(segments):
+                break
+            seg_idx = next_idx
+            next_start, _ = segments[seg_idx]
+            cursor_ea = ea if ea >= next_start else next_start
             continue
 
         lines = _classify_hit_lines(ea, matcher, want_disasm, want_comments)

@@ -105,6 +105,12 @@ def test_py_eval_exception_goes_to_stderr():
 
 
 @test()
+def test_py_eval_has_short_tool_timeout_override():
+    """py_eval should not inherit the 60s global timeout for inline snippets."""
+    assert getattr(py_eval, "__ida_mcp_timeout_sec__", None) == 10.0
+
+
+@test()
 def test_py_exec_file_runs_script_and_captures_stdout():
     """py_exec_file executes a script file and captures its stdout."""
     with _tmp_script('print("hello from file")\nresult = 42\n') as path:

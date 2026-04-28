@@ -1,5 +1,7 @@
 """Tests for api_core API functions."""
 
+import idaapi
+
 from ..framework import (
     test,
     skip_test,
@@ -31,6 +33,7 @@ from ..api_core import (
     find_regex,
     search_text,
 )
+from .. import api_core
 
 
 CRACKME_MAIN = "0x123e"
@@ -553,3 +556,67 @@ def test_search_text_regex_mode():
         skip_test("no call/jmp in binary")
     for h in result["hits"]:
         assert h["matches"]
+
+
+@test()
+def test_search_text_badaddr_stops_without_rescanning_every_segment():
+    """A miss after the current cursor should terminate immediately."""
+    original_exec_segments = api_core._exec_segments
+    original_find_text = api_core.ida_search.find_text
+    try:
+        calls = []
+        api_core._exec_segments = lambda: [(0x1000, 0x1100), (0x2000, 0x2100), (0x3000, 0x3100)]
+
+        def fake_find_text(start_ea, _y, _x, pattern, _sflag):
+            calls.append((start_ea, pattern))
+            return idaapi.BADADDR
+
+        api_core.ida_search.find_text = fake_find_text
+        result = search_text("never-hits", limit=5)
+    finally:
+        api_core._exec_segments = original_exec_segments
+        api_core.ida_search.find_text = original_find_text
+
+    assert result["n"] == 0
+    assert result["cursor"].get("done") is True
+    assert calls == [(0x1000, "never-hits")]
+
+
+@test()
+def test_search_text_jumps_directly_to_later_exec_segment():
+    """A hit in a later exec segment should not force rescanning intermediate tails."""
+    original_exec_segments = api_core._exec_segments
+    original_find_text = api_core.ida_search.find_text
+    original_classify = api_core._classify_hit_lines
+    original_item_size = api_core.idaapi.get_item_size
+    original_get_func = api_core.idaapi.get_func
+    original_getseg = api_core.idaapi.getseg
+    try:
+        calls = []
+        api_core._exec_segments = lambda: [(0x1000, 0x1100), (0x2000, 0x2100), (0x3000, 0x3100)]
+
+        sequence = iter([0x3004, idaapi.BADADDR])
+
+        def fake_find_text(start_ea, _y, _x, pattern, _sflag):
+            calls.append((start_ea, pattern))
+            return next(sequence)
+
+        api_core.ida_search.find_text = fake_find_text
+        api_core._classify_hit_lines = lambda ea, *_args, **_kwargs: [{"kind": "disasm", "text": f"match@{ea:x}"}]
+        api_core.idaapi.get_item_size = lambda _ea: 4
+        api_core.idaapi.get_func = lambda _ea: None
+        api_core.idaapi.getseg = lambda _ea: None
+
+        result = search_text("late-hit", limit=1)
+    finally:
+        api_core._exec_segments = original_exec_segments
+        api_core.ida_search.find_text = original_find_text
+        api_core._classify_hit_lines = original_classify
+        api_core.idaapi.get_item_size = original_item_size
+        api_core.idaapi.get_func = original_get_func
+        api_core.idaapi.getseg = original_getseg
+
+    assert result["n"] == 1
+    assert result["hits"][0]["addr"] == "0x3004"
+    assert result["cursor"].get("next") == "0x3008"
+    assert calls == [(0x1000, "late-hit"), (0x3004, "late-hit")]

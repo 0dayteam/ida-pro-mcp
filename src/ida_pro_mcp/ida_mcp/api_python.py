@@ -22,7 +22,7 @@ import ida_xref
 import os
 
 from .rpc import tool, unsafe
-from .sync import idasync
+from .sync import idasync, tool_timeout
 from .utils import parse_address, get_function
 
 # ============================================================================
@@ -106,14 +106,17 @@ class PythonExecResult(TypedDict):
 # Python Evaluation
 # ============================================================================
 
+_PY_EVAL_TIMEOUT_SEC = 10.0
+
 
 @tool
 @idasync
+@tool_timeout(_PY_EVAL_TIMEOUT_SEC)
 @unsafe
 def py_eval(
     code: Annotated[str, "Python code"],
 ) -> PythonExecResult:
-    """Execute Python in IDA context and return result/stdout/stderr."""
+    """Execute short Python snippets in IDA context and return result/stdout/stderr."""
     # Capture stdout/stderr
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
