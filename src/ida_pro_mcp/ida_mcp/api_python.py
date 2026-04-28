@@ -124,30 +124,26 @@ def py_eval(
         sys.stdout = stdout_capture
         sys.stderr = stderr_capture
 
-        exec_globals = _make_exec_globals()
-
+        exec_namespace = _make_exec_globals()
         result_value = None
-        exec_locals = {}
 
         # Parse code with AST to properly handle execution
         try:
             tree = ast.parse(code)
         except SyntaxError:
             # If parsing fails, fall back to direct exec
-            exec(code, exec_globals, exec_locals)
-            exec_globals.update(exec_locals)
-            if "result" in exec_locals:
-                result_value = str(exec_locals["result"])
-            elif exec_locals:
-                last_key = list(exec_locals.keys())[-1]
-                result_value = str(exec_locals[last_key])
+            exec(code, exec_namespace)
+            if "result" in exec_namespace:
+                result_value = str(exec_namespace["result"])
+            else:
+                result_value = _last_user_value(exec_namespace)
         else:
             if not tree.body:
                 # Empty code
                 pass
             elif len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr):
                 # Single expression - use eval
-                result_value = str(eval(code, exec_globals))
+                result_value = str(eval(code, exec_namespace))
             elif isinstance(tree.body[-1], ast.Expr):
                 # Multiple statements, last one is an expression (Jupyter-style)
                 # Execute all statements except the last
@@ -155,26 +151,22 @@ def py_eval(
                     exec_tree = ast.Module(body=tree.body[:-1], type_ignores=[])
                     exec(
                         compile(exec_tree, "<string>", "exec"),
-                        exec_globals,
-                        exec_locals,
+                        exec_namespace,
                     )
-                    exec_globals.update(exec_locals)
                 # Eval only the last expression
                 eval_tree = ast.Expression(body=tree.body[-1].value)
                 result_value = str(
-                    eval(compile(eval_tree, "<string>", "eval"), exec_globals)
+                    eval(compile(eval_tree, "<string>", "eval"), exec_namespace)
                 )
             else:
                 # All statements (no trailing expression)
-                exec(code, exec_globals, exec_locals)
-                exec_globals.update(exec_locals)
+                exec(code, exec_namespace)
                 # Return 'result' variable if explicitly set
-                if "result" in exec_locals:
-                    result_value = str(exec_locals["result"])
+                if "result" in exec_namespace:
+                    result_value = str(exec_namespace["result"])
                 # Return last assigned variable
-                elif exec_locals:
-                    last_key = list(exec_locals.keys())[-1]
-                    result_value = str(exec_locals[last_key])
+                else:
+                    result_value = _last_user_value(exec_namespace)
 
         # Collect output
         stdout_text = stdout_capture.getvalue()
@@ -197,6 +189,17 @@ def py_eval(
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
+
+
+def _last_user_value(namespace: dict) -> str | None:
+    """Return the last value assigned by user code, ignoring built-in context."""
+    for key in reversed(namespace):
+        if key not in _EXEC_CONTEXT_KEYS:
+            return str(namespace[key])
+    return None
+
+
+_EXEC_CONTEXT_KEYS = frozenset(_make_exec_globals())
 
 
 @tool

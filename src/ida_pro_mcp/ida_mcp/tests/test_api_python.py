@@ -46,6 +46,38 @@ def test_py_eval_stdout_capture():
 
 
 @test()
+def test_py_eval_generator_expression_sees_assigned_names():
+    """py_eval uses one namespace so generator expressions can resolve assigned names."""
+    result = py_eval("x = 3\nresult = list(x for _ in range(1))")
+    assert result["result"] == "[3]"
+    assert result["stderr"] == ""
+
+
+@test()
+def test_py_eval_lambda_sees_assigned_names():
+    """py_eval uses one namespace so lambdas can resolve assigned names."""
+    result = py_eval("x = 3\nresult = (lambda: x)()")
+    assert result["result"] == "3"
+    assert result["stderr"] == ""
+
+
+@test()
+def test_py_eval_function_definition_sees_assigned_names():
+    """py_eval uses one namespace so defined functions can resolve assigned names."""
+    result = py_eval("x = 3\ndef f():\n    return x\nresult = f()")
+    assert result["result"] == "3"
+    assert result["stderr"] == ""
+
+
+@test()
+def test_py_eval_comprehension_nested_lambda_sees_assigned_names():
+    """py_eval keeps comprehension scopes connected to the shared namespace."""
+    result = py_eval("x = 3\nresult = [(lambda: x)() for _ in range(1)]")
+    assert result["result"] == "[3]"
+    assert result["stderr"] == ""
+
+
+@test()
 def test_py_eval_stderr_capture():
     """py_eval captures explicit stderr output."""
     code = 'import sys\nsys.stderr.write("warn\\n")\nresult = "done"'
