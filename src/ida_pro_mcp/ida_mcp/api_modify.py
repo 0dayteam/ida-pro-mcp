@@ -11,7 +11,8 @@ import ida_dirtree
 import ida_funcs
 import ida_ua
 
-from .compat import tinfo_get_udm
+from .compat import inf_is_64bit, tinfo_get_udm
+from .arm64_branch_patch import assemble_supported_arm64_branch
 from .rpc import tool
 from .sync import idasync, IDAError
 from .utils import (
@@ -258,6 +259,10 @@ def _append_comment_text(current: str, new_text: str, *, dedupe: bool) -> tuple[
     return f"{current}{joiner}{new_text}", False
 
 
+def _is_aarch64_database() -> bool:
+    return idaapi.ph_get_id() == idaapi.PLFM_ARM and inf_is_64bit()
+
+
 @tool
 @idasync
 def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[PatchAsmResult]:
@@ -276,6 +281,12 @@ def patch_asm(items: list[AsmPatchOp] | AsmPatchOp) -> list[PatchAsmResult]:
             for assemble in assembles:
                 assemble = assemble.strip()
                 try:
+                    if _is_aarch64_database():
+                        rewritten = assemble_supported_arm64_branch(ea, assemble)
+                        if rewritten is not None:
+                            ida_bytes.patch_bytes(ea, rewritten)
+                            ea += len(rewritten)
+                            continue
                     (check_assemble, bytes_to_patch) = idautils.Assemble(ea, assemble)
                     if not check_assemble:
                         results.append(

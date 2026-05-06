@@ -23,6 +23,7 @@ venv*/
 *.til
 *.elf
 !tests/typed_fixture.elf
+!tests/arm64_patch_fixture.elf
 
 # Generated server files
 server_generated.py

@@ -20,6 +20,7 @@ from ..api_modify import (
 )
 from ..api_memory import get_bytes, patch
 from ..api_core import lookup_funcs
+from ..arm64_branch_patch import assemble_supported_arm64_branch
 
 
 CRACKME_MAIN = "0x123e"
@@ -28,6 +29,8 @@ CRACKME_FRAME_DUMMY = "0x11a0"
 TYPED_FIXTURE_IMMEDIATE_1234 = "0x1013e44"
 TYPED_FIXTURE_USE_WRAPPER = "0x1013dc0"
 TYPED_FIXTURE_LOCAL_NAME = "rhs_handle"
+ARM64_PATCH_FIXTURE_BRANCH_SITE = "branch_site"
+ARM64_PATCH_FIXTURE_ALTERNATE_TARGET = "alternate_target"
 
 
 def _require_any_function() -> str:
@@ -38,7 +41,13 @@ def _require_any_function() -> str:
 
 
 def _plain_hex_bytes(text: str) -> str:
-    return text.replace("0x", "").replace(" ", "").lower()
+    parts = []
+    for token in text.split():
+        if token.lower().startswith("0x"):
+            parts.append(f"{int(token, 16):02x}")
+        else:
+            parts.append(token.lower())
+    return "".join(parts)
 
 
 @test()
@@ -182,6 +191,50 @@ def test_patch_asm_invalid_instruction_reports_error():
     result = patch_asm({"addr": TYPED_FIXTURE_IMMEDIATE_1234, "asm": "not an instruction"})
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="Failed to assemble")
+
+
+@test(binary="arm64_patch_fixture.elf")
+def test_patch_asm_arm64_bl_absolute_hex_roundtrip():
+    """patch_asm can encode safe AArch64 `bl 0x...` branches without IDA assembler support."""
+    branch_addr = get_named_address(ARM64_PATCH_FIXTURE_BRANCH_SITE)
+    alternate_addr = get_named_address(ARM64_PATCH_FIXTURE_ALTERNATE_TARGET)
+    if not branch_addr or not alternate_addr:
+        skip_test("arm64 branch fixture symbols not present")
+
+    original = get_bytes({"addr": branch_addr, "size": 4})[0]
+    assert_ok(original, "data")
+    original_plain = _plain_hex_bytes(original["data"])
+
+    expected = assemble_supported_arm64_branch(
+        int(branch_addr, 16), f"bl {alternate_addr}"
+    )
+    assert expected is not None
+    expected_plain = expected.hex()
+
+    try:
+        result = patch_asm({"addr": branch_addr, "asm": f"bl {alternate_addr}"})
+        assert_is_list(result, min_length=1)
+        assert "error" not in result[0]
+        changed = get_bytes({"addr": branch_addr, "size": 4})[0]
+        assert _plain_hex_bytes(changed["data"]) == expected_plain
+        assert _plain_hex_bytes(changed["data"]) != original_plain
+    finally:
+        patch({"addr": branch_addr, "data": original_plain})
+
+    restored = get_bytes({"addr": branch_addr, "size": 4})[0]
+    assert _plain_hex_bytes(restored["data"]) == original_plain
+
+
+@test(binary="arm64_patch_fixture.elf")
+def test_patch_asm_arm64_unaligned_hex_target_reports_error():
+    """patch_asm rejects AArch64 hex branch targets that cannot be encoded safely."""
+    branch_addr = get_named_address(ARM64_PATCH_FIXTURE_BRANCH_SITE)
+    if not branch_addr:
+        skip_test("arm64 branch fixture symbol not present")
+
+    result = patch_asm({"addr": branch_addr, "asm": "bl 0x1002"})
+    assert_is_list(result, min_length=1)
+    assert_error(result[0], contains="4-byte aligned")
 
 
 @test()

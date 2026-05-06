@@ -112,12 +112,14 @@ Measure coverage across both maintained fixtures:
 uv run coverage erase
 uv run coverage run -m ida_pro_mcp.test tests/crackme03.elf -q
 uv run coverage run --append -m ida_pro_mcp.test tests/typed_fixture.elf -q
+uv run coverage run --append -m ida_pro_mcp.test tests/arm64_patch_fixture.elf -q
 uv run coverage report --show-missing
 ```
 
 Current fixture intent:
 - `tests/crackme03.elf`: compact general regression fixture
 - `tests/typed_fixture.elf`: typed globals / structs / locals / stack coverage fixture
+- `tests/arm64_patch_fixture.elf`: minimal AArch64 branch-patching fixture
 
 ### Test expectations
 - Prefer semantic assertions, not weak "field exists" checks
