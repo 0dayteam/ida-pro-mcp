@@ -40,10 +40,14 @@ class DebugControlResult(TypedDict, total=False):
     ip: str
     started: bool
     continued: bool
+    attached: bool
+    detached: bool
+    paused: bool
     running: bool
     suspended: bool
     exited: bool
     state: str
+    event_code: int
     error: str
 
 
@@ -65,6 +69,17 @@ class StackFrameInfo(TypedDict):
     addr: str
     module: str
     symbol: str
+
+
+class ThreadInfoResult(TypedDict):
+    tid: int
+
+
+class ModuleInfoResult(TypedDict, total=False):
+    name: str
+    base: str
+    size: int
+    rebase_to: str
 
 
 class DebugMemoryReadResult(TypedDict):
@@ -140,6 +155,16 @@ def _get_debug_state_result() -> DebugControlResult:
         if ip is not None:
             result["ip"] = hex(ip)
     return result
+
+
+def _wait_for_suspend(timeout_ms: int) -> tuple[DebugControlResult, int]:
+    event_code = ida_dbg.wait_for_next_event(
+        ida_dbg.WFNE_ANY | ida_dbg.WFNE_SUSP | ida_dbg.WFNE_SILENT,
+        timeout_ms,
+    )
+    result = _get_debug_state_result()
+    result["event_code"] = int(event_code)
+    return result, int(event_code)
 
 
 def dbg_ensure_active() -> "ida_idd.debugger_t":
@@ -489,6 +514,69 @@ def dbg_continue() -> DebugControlResult:
 @unsafe
 @tool
 @idasync
+def dbg_attach(
+    pid: Annotated[int, "Target process ID"],
+    event_id: Annotated[int, "Optional debugger-specific attach event id"] = -1,
+) -> DebugControlResult:
+    """Attach debugger to an existing process."""
+    if ida_dbg.is_debugger_on():
+        raise IDAError("Debugger is already active")
+    if ida_dbg.attach_process(int(pid), int(event_id)) < 0:
+        raise IDAError(f"Failed to attach to process {pid}")
+    result = _get_debug_state_result()
+    result["attached"] = True
+    return result
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_detach() -> DebugControlResult:
+    """Detach debugger from the active process without killing it."""
+    dbg_ensure_active()
+    if not ida_dbg.detach_process():
+        raise IDAError("Failed to detach debugger")
+    result = _get_debug_state_result()
+    result["detached"] = True
+    return result
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_pause() -> DebugControlResult:
+    """Suspend a running debuggee."""
+    dbg_ensure_active()
+    if ida_dbg.get_process_state() == ida_dbg.DSTATE_SUSP:
+        result = _get_debug_state_result()
+        result["paused"] = True
+        return result
+    if not ida_dbg.suspend_process():
+        raise IDAError("Failed to suspend debugger")
+    result = _get_debug_state_result()
+    result["paused"] = True
+    return result
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_wait_suspend(
+    timeout_ms: Annotated[int, "Milliseconds to wait for a suspend event"] = 5000,
+) -> DebugControlResult:
+    """Wait until the debugger suspends or timeout expires."""
+    dbg_ensure_active()
+    result, _event_code = _wait_for_suspend(int(timeout_ms))
+    return result
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
 def dbg_run_to(
     addr: Annotated[str, "Target execution address (hex or decimal)"],
 ) -> DebugControlResult:
@@ -528,6 +616,57 @@ def dbg_step_over() -> DebugControlResult:
         result["continued"] = True
         return result
     raise IDAError("Failed to step over")
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_run_until_return() -> DebugControlResult:
+    """Execute until the current function returns."""
+    dbg_ensure_suspended()
+    if not ida_dbg.step_until_ret():
+        raise IDAError("Failed to step until return")
+    result = _get_debug_state_result()
+    result["continued"] = True
+    return result
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_threads() -> list[ThreadInfoResult]:
+    """List thread IDs in the active debugger session."""
+    dbg_ensure_active()
+    threads = []
+    for index in range(ida_dbg.get_thread_qty()):
+        threads.append({"tid": int(ida_dbg.getn_thread(index))})
+    return threads
+
+
+@ext("dbg")
+@unsafe
+@tool
+@idasync
+def dbg_modules() -> list[ModuleInfoResult]:
+    """List loaded modules in the active debugger session."""
+    dbg_ensure_active()
+    modules = []
+    mod = ida_idd.modinfo_t()
+    ok = ida_dbg.get_first_module(mod)
+    while ok:
+        row: ModuleInfoResult = {
+            "name": str(mod.name),
+            "base": hex(int(mod.base)),
+            "size": int(mod.size),
+        }
+        rebase_to = getattr(mod, "rebase_to", None)
+        if rebase_to not in (None, ida_idaapi.BADADDR):
+            row["rebase_to"] = hex(int(rebase_to))
+        modules.append(row)
+        ok = ida_dbg.get_next_module(mod)
+    return modules
 
 
 # ============================================================================

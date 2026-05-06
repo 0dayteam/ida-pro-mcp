@@ -15,6 +15,7 @@ from ..framework import (
 )
 from ..api_types import (
     declare_type,
+    declare_udt,
     enum_upsert,
     read_struct,
     search_structs,
@@ -88,6 +89,109 @@ def test_declare_type_invalid_declaration():
     result = declare_type("struct broken { int x }")
     assert_is_list(result, min_length=1)
     assert_error(result[0], contains="Failed to parse")
+
+
+@test()
+def test_declare_udt_creates_struct_with_padding():
+    """declare_udt should build a struct from explicit member offsets."""
+    result = declare_udt(
+        {
+            "name": "__DeclareUdtStruct__",
+            "kind": "struct",
+            "replace": True,
+            "members": [
+                {"name": "a", "offset": 0, "type": "int"},
+                {"name": "b", "offset": 8, "type": "char"},
+            ],
+        }
+    )
+    assert_is_list(result, min_length=1)
+    assert "error" not in result[0]
+
+    inspected = type_inspect({"name": "__DeclareUdtStruct__", "include_members": True})[0]
+    assert inspected["exists"] is True
+    assert inspected["member_count"] == 3
+    names = [member["name"] for member in inspected["members"]]
+    assert names == ["a", "__pad_4", "b"]
+
+
+@test()
+def test_declare_udt_replace_overwrites_existing_layout():
+    """declare_udt(replace=true) should replace the whole local type layout."""
+    first = declare_udt(
+        {
+            "name": "__DeclareUdtReplace__",
+            "kind": "struct",
+            "replace": True,
+            "members": [{"name": "a", "offset": 0, "type": "int"}],
+        }
+    )
+    assert_is_list(first, min_length=1)
+    assert "error" not in first[0]
+
+    second = declare_udt(
+        {
+            "name": "__DeclareUdtReplace__",
+            "kind": "struct",
+            "replace": True,
+            "members": [{"name": "b", "offset": 0, "type": "short"}],
+        }
+    )
+    assert_is_list(second, min_length=1)
+    assert "error" not in second[0]
+
+    inspected = type_inspect({"name": "__DeclareUdtReplace__", "include_members": True})[0]
+    assert inspected["exists"] is True
+    assert inspected["member_count"] == 1
+    assert inspected["members"][0]["name"] == "b"
+    assert inspected["members"][0]["type"] == "short"
+
+
+@test()
+def test_declare_udt_union_keeps_member_count():
+    """declare_udt should support unions without requiring distinct offsets."""
+    result = declare_udt(
+        {
+            "name": "__DeclareUdtUnion__",
+            "kind": "union",
+            "replace": True,
+            "members": [
+                {"name": "u32", "type": "unsigned int"},
+                {"name": "bytes", "type": "char[4]"},
+            ],
+        }
+    )
+    assert_is_list(result, min_length=1)
+    assert "error" not in result[0]
+
+    inspected = type_inspect({"name": "__DeclareUdtUnion__", "include_members": True})[0]
+    assert inspected["exists"] is True
+    assert inspected["member_count"] == 2
+
+
+@test()
+def test_declare_udt_duplicate_without_replace_fails():
+    """declare_udt should reject duplicate type names unless replace=true."""
+    first = declare_udt(
+        {
+            "name": "__DeclareUdtDuplicate__",
+            "kind": "struct",
+            "replace": True,
+            "members": [{"name": "a", "offset": 0, "type": "int"}],
+        }
+    )
+    assert_is_list(first, min_length=1)
+    assert "error" not in first[0]
+
+    second = declare_udt(
+        {
+            "name": "__DeclareUdtDuplicate__",
+            "kind": "struct",
+            "members": [{"name": "b", "offset": 0, "type": "int"}],
+        }
+    )
+    assert_is_list(second, min_length=1)
+    assert_error(second[0], contains="already exists")
 
 
 @test()

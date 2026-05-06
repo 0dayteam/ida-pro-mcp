@@ -5,6 +5,9 @@ import idautils
 import idc
 import ida_hexrays
 import ida_bytes
+import ida_nalt
+import ida_idp
+import ida_offset
 import ida_typeinf
 import ida_frame
 import ida_dirtree
@@ -28,6 +31,10 @@ from .utils import (
     StackRename,
     RenameBatch,
     DefineOp,
+    DefineDataOp,
+    DefineArrayOp,
+    DefineStringOp,
+    OperandReprOp,
     UndefineOp,
 )
 
@@ -89,7 +96,39 @@ class DefineResult(TypedDict, total=False):
     end: str
     size: int
     length: int
+    count: int
+    kind: str
+    strtype: str
+    action: str
+    operand: int
     error: str
+
+
+DATA_KIND_CREATORS = {
+    "byte": (ida_bytes.create_byte, 1),
+    "word": (ida_bytes.create_word, 2),
+    "dword": (ida_bytes.create_dword, 4),
+    "qword": (ida_bytes.create_qword, 8),
+    "oword": (ida_bytes.create_oword, 16),
+    "tbyte": (ida_bytes.create_tbyte, ida_idp.ph_get_tbyte_size()),
+    "float": (ida_bytes.create_float, 4),
+    "double": (ida_bytes.create_double, 8),
+}
+
+STRING_TYPES = {
+    "c": ida_nalt.STRTYPE_C,
+    "c_16": ida_nalt.STRTYPE_C_16,
+    "c_32": ida_nalt.STRTYPE_C_32,
+    "pascal": ida_nalt.STRTYPE_PASCAL,
+    "pascal_16": ida_nalt.STRTYPE_PASCAL_16,
+    "pascal_32": ida_nalt.STRTYPE_PASCAL_32,
+    "len2": ida_nalt.STRTYPE_LEN2,
+    "len2_16": ida_nalt.STRTYPE_LEN2_16,
+    "len2_32": ida_nalt.STRTYPE_LEN2_32,
+    "len4": ida_nalt.STRTYPE_LEN4,
+    "len4_16": ida_nalt.STRTYPE_LEN4_16,
+    "len4_32": ida_nalt.STRTYPE_LEN4_32,
+}
 
 
 # ============================================================================
@@ -261,6 +300,69 @@ def _append_comment_text(current: str, new_text: str, *, dedupe: bool) -> tuple[
 
 def _is_aarch64_database() -> bool:
     return idaapi.ph_get_id() == idaapi.PLFM_ARM and inf_is_64bit()
+
+
+def _parse_data_kind(kind: object) -> tuple[Any, int, str]:
+    kind_name = str(kind or "").strip().lower()
+    if kind_name not in DATA_KIND_CREATORS:
+        supported = "|".join(DATA_KIND_CREATORS)
+        raise IDAError(f"Unsupported data kind: {kind_name or '<empty>'} (expected {supported})")
+    creator, item_size = DATA_KIND_CREATORS[kind_name]
+    return creator, item_size, kind_name
+
+
+def _ensure_no_overlap(ea: int, size: int, force: bool) -> None:
+    if size <= 0:
+        raise IDAError("Size must be positive")
+    if force:
+        if not ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, size):
+            raise IDAError(f"Failed to undefine {size} bytes at {hex(ea)}")
+        return
+    flags = ida_bytes.get_flags(ea)
+    if ida_bytes.is_unknown(flags):
+        return
+    current_size = ida_bytes.get_item_size(ea)
+    if current_size <= 0:
+        current_size = 1
+    raise IDAError(
+        f"Address {hex(ea)} is already defined as a {current_size}-byte item; set force=true to replace it"
+    )
+
+
+def _create_scalar_data(ea: int, kind: object, force: bool) -> tuple[str, int]:
+    creator, size, kind_name = _parse_data_kind(kind)
+    _ensure_no_overlap(ea, size, force)
+    if not creator(ea, size, force):
+        raise IDAError(f"Failed to create {kind_name} at {hex(ea)}")
+    return kind_name, size
+
+
+def _get_existing_item_shape(ea: int) -> tuple[int, int]:
+    flags = ida_bytes.get_flags(ea)
+    if ida_bytes.is_unknown(flags):
+        raise IDAError("Address is not defined; provide kind to create a typed array")
+    item_size = ida_bytes.get_item_size(ea)
+    if item_size <= 0:
+        raise IDAError(f"Failed to determine item size at {hex(ea)}")
+    return flags, item_size
+
+
+def _parse_string_type(strtype: object) -> tuple[int, str]:
+    key = str(strtype or "c").strip().lower()
+    if key not in STRING_TYPES:
+        supported = "|".join(STRING_TYPES)
+        raise IDAError(f"Unsupported string type: {key or '<empty>'} (expected {supported})")
+    return STRING_TYPES[key], key
+
+
+def _get_struct_tid(name: str) -> int:
+    tid = ida_typeinf.get_named_type_tid(name)
+    if tid == idaapi.BADADDR:
+        raise IDAError(f"Struct not found: {name}")
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_type_by_tid(tid) or not tif.is_udt():
+        raise IDAError(f"Type is not a struct/union: {name}")
+    return tid
 
 
 @tool
@@ -872,6 +974,231 @@ def define_code(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
                 )
         except Exception as e:
             results.append({"addr": addr_str, "error": str(e)})
+
+    return results
+
+
+@tool
+@idasync
+def define_data(items: list[DefineDataOp] | DefineDataOp) -> list[DefineResult]:
+    """Define scalar data items at address(es)."""
+    if isinstance(items, dict):
+        items = [items]
+
+    results = []
+    for item in items:
+        addr_str = item.get("addr", "")
+        kind = item.get("kind", "")
+        force = bool(item.get("force", False))
+
+        try:
+            ea = parse_address(addr_str)
+            kind_name, size = _create_scalar_data(ea, kind, force)
+            results.append(
+                {
+                    "addr": addr_str,
+                    "start": hex(ea),
+                    "size": size,
+                    "kind": kind_name,
+                }
+            )
+        except Exception as e:
+            results.append({"addr": addr_str, "kind": str(kind or ""), "error": str(e)})
+
+    return results
+
+
+@tool
+@idasync
+def define_array(items: list[DefineArrayOp] | DefineArrayOp) -> list[DefineResult]:
+    """Define scalar arrays at address(es)."""
+    if isinstance(items, dict):
+        items = [items]
+
+    results = []
+    for item in items:
+        addr_str = item.get("addr", "")
+        raw_count = item.get("count", 0)
+        kind = item.get("kind")
+        force = bool(item.get("force", False))
+
+        try:
+            ea = parse_address(addr_str)
+            count = int(raw_count)
+            if count <= 0:
+                raise IDAError("count must be > 0")
+
+            if kind:
+                kind_name, item_size = _create_scalar_data(ea, kind, force)
+                flags = ida_bytes.get_flags(ea)
+                tid = ida_bytes.get_tid(ea)
+            else:
+                flags, item_size = _get_existing_item_shape(ea)
+                kind_name = ""
+                tid = ida_bytes.get_tid(ea)
+                if force:
+                    total_size = item_size * count
+                    if not ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, total_size):
+                        raise IDAError(f"Failed to undefine {total_size} bytes at {hex(ea)}")
+                    if not ida_bytes.create_data(ea, flags, total_size, tid):
+                        raise IDAError(f"Failed to recreate array base item at {hex(ea)}")
+                    results.append(
+                        {
+                            "addr": addr_str,
+                            "start": hex(ea),
+                            "size": total_size,
+                            "count": count,
+                            "kind": kind_name,
+                        }
+                    )
+                    continue
+
+            total_size = item_size * count
+            if not ida_bytes.create_data(ea, flags, total_size, tid):
+                raise IDAError(f"Failed to create array at {hex(ea)}")
+
+            results.append(
+                {
+                    "addr": addr_str,
+                    "start": hex(ea),
+                    "size": total_size,
+                    "count": count,
+                    "kind": kind_name,
+                }
+            )
+        except Exception as e:
+            results.append({"addr": addr_str, "error": str(e)})
+
+    return results
+
+
+@tool
+@idasync
+def define_string(items: list[DefineStringOp] | DefineStringOp) -> list[DefineResult]:
+    """Define string literals at address(es)."""
+    if isinstance(items, dict):
+        items = [items]
+
+    results = []
+    for item in items:
+        addr_str = item.get("addr", "")
+        raw_length = item.get("length", 0)
+        force = bool(item.get("force", False))
+        try:
+            ea = parse_address(addr_str)
+            strtype, strtype_name = _parse_string_type(item.get("strtype"))
+            length = int(raw_length or 0)
+            if length < 0:
+                raise IDAError("length must be >= 0")
+            if force:
+                delete_size = length or max(ida_bytes.get_item_size(ea), 1)
+                if not ida_bytes.del_items(ea, ida_bytes.DELIT_EXPAND, delete_size):
+                    raise IDAError(f"Failed to undefine {delete_size} bytes at {hex(ea)}")
+            elif not ida_bytes.is_unknown(ida_bytes.get_flags(ea)):
+                raise IDAError(
+                    f"Address {hex(ea)} is already defined; set force=true to replace it"
+                )
+
+            if not ida_bytes.create_strlit(ea, length, strtype):
+                raise IDAError(f"Failed to create string literal at {hex(ea)}")
+            item_size = ida_bytes.get_item_size(ea)
+            results.append(
+                {
+                    "addr": addr_str,
+                    "start": hex(ea),
+                    "end": hex(ea + item_size),
+                    "size": item_size,
+                    "strtype": strtype_name,
+                }
+            )
+        except Exception as e:
+            results.append({"addr": addr_str, "error": str(e)})
+
+    return results
+
+
+@tool
+@idasync
+def set_operand_repr(items: list[OperandReprOp] | OperandReprOp) -> list[DefineResult]:
+    """Set operand display/typing representation for instructions."""
+    if isinstance(items, dict):
+        items = [items]
+
+    results = []
+    for item in items:
+        addr_str = item.get("addr", "")
+        raw_operand = item.get("operand", 0)
+        action = str(item.get("action", "") or "").strip().lower()
+
+        try:
+            ea = parse_address(addr_str)
+            operand = int(raw_operand)
+            if operand < 0:
+                raise IDAError("operand must be >= 0")
+
+            if action == "hex":
+                ok = ida_bytes.op_hex(ea, operand)
+            elif action == "dec":
+                ok = ida_bytes.op_dec(ea, operand)
+            elif action == "oct":
+                ok = ida_bytes.op_oct(ea, operand)
+            elif action == "bin":
+                ok = ida_bytes.op_bin(ea, operand)
+            elif action == "char":
+                ok = ida_bytes.op_chr(ea, operand)
+            elif action == "enum":
+                enum_name = str(item.get("enum_name", "") or "").strip()
+                if not enum_name:
+                    raise IDAError("enum_name is required for enum action")
+                enum_id = idc.get_enum(enum_name)
+                if enum_id == idaapi.BADADDR:
+                    raise IDAError(f"Enum not found: {enum_name}")
+                ok = ida_bytes.op_enum(ea, operand, enum_id, 0)
+            elif action == "offset":
+                offset_base = parse_address(item.get("offset_base", "0"))
+                ok = ida_offset.op_plain_offset(ea, operand, offset_base)
+            elif action == "stackvar":
+                ok = ida_bytes.op_stkvar(ea, operand)
+            elif action == "segment":
+                ok = ida_bytes.op_seg(ea, operand)
+            elif action == "struct_offset":
+                struct_name = str(item.get("struct_name", "") or "").strip()
+                if not struct_name:
+                    raise IDAError("struct_name is required for struct_offset action")
+                delta = int(item.get("delta", 0) or 0)
+                tid = _get_struct_tid(struct_name)
+                insn = ida_ua.insn_t()
+                insn.ea = ea
+                if ida_ua.decode_insn(insn, ea) == 0:
+                    raise IDAError(f"Failed to decode instruction at {hex(ea)}")
+                ok = ida_bytes.op_stroff(insn, operand, [tid], delta)
+            elif action == "reset":
+                ok = ida_bytes.clr_op_type(ea, operand)
+            else:
+                raise IDAError(
+                    "Unsupported action: "
+                    f"{action or '<empty>'} (expected hex|dec|oct|bin|char|enum|offset|stackvar|segment|struct_offset|reset)"
+                )
+
+            if not ok:
+                raise IDAError(f"Failed to apply {action} at {hex(ea)} operand {operand}")
+            results.append(
+                {
+                    "addr": addr_str,
+                    "start": hex(ea),
+                    "action": action,
+                    "operand": operand,
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "addr": addr_str,
+                    "action": action,
+                    "operand": int(raw_operand or 0),
+                    "error": str(e),
+                }
+            )
 
     return results
 

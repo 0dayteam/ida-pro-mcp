@@ -542,6 +542,174 @@ def test_dbg_set_bp_condition_can_set_python_language():
 
 
 @test()
+def test_dbg_attach_reports_attached_state():
+    """dbg_attach should surface attached state when attach_process succeeds."""
+    patches = [
+        _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: False),
+        _SavedAttr(api_debug.ida_dbg, "attach_process", lambda pid, event_id: 1),
+        _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: api_debug.ida_dbg.DSTATE_SUSP),
+        _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: 0x401000),
+    ]
+    try:
+        result = api_debug.dbg_attach(1234)
+        assert result == {
+            "attached": True,
+            "state": "suspended",
+            "suspended": True,
+            "ip": "0x401000",
+        }
+    finally:
+        for patch in reversed(patches):
+            patch.restore()
+
+
+@test()
+def test_dbg_detach_reports_detached_state():
+    """dbg_detach should report detachment without killing the target."""
+    patches = [
+        _SavedAttr(api_debug, "dbg_ensure_active", lambda: object()),
+        _SavedAttr(api_debug.ida_dbg, "detach_process", lambda: True),
+        _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: False),
+    ]
+    try:
+        result = api_debug.dbg_detach()
+        assert result == {"detached": True, "state": "not_running"}
+    finally:
+        for patch in reversed(patches):
+            patch.restore()
+
+
+@test()
+def test_dbg_pause_marks_already_suspended_session():
+    """dbg_pause should be a no-op success when the session is already suspended."""
+    patches = [
+        _SavedAttr(api_debug, "dbg_ensure_active", lambda: object()),
+        _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: api_debug.ida_dbg.DSTATE_SUSP),
+        _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: True),
+        _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: 0x401000),
+    ]
+    try:
+        result = api_debug.dbg_pause()
+        assert result == {
+            "paused": True,
+            "state": "suspended",
+            "suspended": True,
+            "ip": "0x401000",
+        }
+    finally:
+        for patch in reversed(patches):
+            patch.restore()
+
+
+@test()
+def test_dbg_wait_suspend_reports_event_code():
+    """dbg_wait_suspend should return event code and final debugger state."""
+    patches = [
+        _SavedAttr(api_debug, "dbg_ensure_active", lambda: object()),
+        _SavedAttr(api_debug.ida_dbg, "wait_for_next_event", lambda flags, timeout: 77),
+        _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: True),
+        _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: api_debug.ida_dbg.DSTATE_SUSP),
+        _SavedAttr(api_debug.ida_dbg, "get_ip_val", lambda: 0x401234),
+    ]
+    try:
+        result = api_debug.dbg_wait_suspend(2500)
+        assert result == {
+            "state": "suspended",
+            "suspended": True,
+            "ip": "0x401234",
+            "event_code": 77,
+        }
+    finally:
+        for patch in reversed(patches):
+            patch.restore()
+
+
+@test()
+def test_dbg_run_until_return_reports_continue():
+    """dbg_run_until_return should use step-until-ret and mark continued state."""
+    patches = [
+        _SavedAttr(api_debug, "dbg_ensure_suspended", lambda: object()),
+        _SavedAttr(api_debug.ida_dbg, "step_until_ret", lambda: True),
+        _SavedAttr(api_debug.ida_dbg, "is_debugger_on", lambda: True),
+        _SavedAttr(api_debug.ida_dbg, "get_process_state", lambda: api_debug.ida_dbg.DSTATE_RUN),
+    ]
+    try:
+        result = api_debug.dbg_run_until_return()
+        assert result == {"continued": True, "state": "running", "running": True}
+    finally:
+        for patch in reversed(patches):
+            patch.restore()
+
+
+@test()
+def test_dbg_threads_lists_thread_ids():
+    """dbg_threads should enumerate thread IDs in index order."""
+    patches = [
+        _SavedAttr(api_debug, "dbg_ensure_active", lambda: object()),
+        _SavedAttr(api_debug.ida_dbg, "get_thread_qty", lambda: 3),
+        _SavedAttr(api_debug.ida_dbg, "getn_thread", lambda index: [11, 22, 33][index]),
+    ]
+    try:
+        assert api_debug.dbg_threads() == [{"tid": 11}, {"tid": 22}, {"tid": 33}]
+    finally:
+        for patch in reversed(patches):
+            patch.restore()
+
+
+@test()
+def test_dbg_modules_lists_loaded_modules():
+    """dbg_modules should walk the module iterator and normalize fields."""
+
+    class _FakeModInfo:
+        def __init__(self):
+            self.name = ""
+            self.base = 0
+            self.size = 0
+            self.rebase_to = api_debug.ida_idaapi.BADADDR
+
+    modules = iter(
+        [
+            ("main.bin", 0x400000, 0x1000, api_debug.ida_idaapi.BADADDR),
+            ("libx.so", 0x500000, 0x2000, 0x600000),
+        ]
+    )
+
+    def get_first_module(mod):
+        name, base, size, rebase_to = next(modules)
+        mod.name = name
+        mod.base = base
+        mod.size = size
+        mod.rebase_to = rebase_to
+        return True
+
+    def get_next_module(mod):
+        try:
+            name, base, size, rebase_to = next(modules)
+        except StopIteration:
+            return False
+        mod.name = name
+        mod.base = base
+        mod.size = size
+        mod.rebase_to = rebase_to
+        return True
+
+    patches = [
+        _SavedAttr(api_debug, "dbg_ensure_active", lambda: object()),
+        _SavedAttr(api_debug.ida_idd, "modinfo_t", _FakeModInfo),
+        _SavedAttr(api_debug.ida_dbg, "get_first_module", get_first_module),
+        _SavedAttr(api_debug.ida_dbg, "get_next_module", get_next_module),
+    ]
+    try:
+        assert api_debug.dbg_modules() == [
+            {"name": "main.bin", "base": "0x400000", "size": 4096},
+            {"name": "libx.so", "base": "0x500000", "size": 8192, "rebase_to": "0x600000"},
+        ]
+    finally:
+        for patch in reversed(patches):
+            patch.restore()
+
+
+@test()
 def test_dbg_set_bp_condition_clears_old_condition_before_language_switch():
     """Changing language with an existing condition should clear first, then switch, then set."""
 

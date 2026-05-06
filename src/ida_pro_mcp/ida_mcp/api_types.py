@@ -1,4 +1,4 @@
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, NotRequired, TypedDict
 
 import idc
 import ida_typeinf
@@ -27,6 +27,8 @@ from .utils import (
     TypeQuery,
     TypeApplyBatch,
     EnumUpsert,
+    UdtDeclareOp,
+    UdtMemberDecl,
 )
 from . import compat
 from .compat import tinfo_get_udm
@@ -34,6 +36,23 @@ from .compat import tinfo_get_udm
 
 class DeclareTypeResult(TypedDict, total=False):
     decl: str
+    name: str
+    error: str
+
+
+class UdtMemberResult(TypedDict, total=False):
+    name: str
+    offset: int
+    type: str
+    comment: str
+
+
+class DeclareUdtResult(TypedDict, total=False):
+    name: str
+    kind: str
+    decl: str
+    members: list[UdtMemberResult]
+    replaced: bool
     error: str
 
 
@@ -154,6 +173,67 @@ class InferTypeResult(TypedDict, total=False):
 # ============================================================================
 
 
+def _format_udt_member_comment(comment: str) -> str:
+    lines = [line.strip() for line in comment.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return " /* " + " | ".join(lines) + " */"
+
+
+def _normalize_udt_members(members: list[UdtMemberDecl] | UdtMemberDecl | object) -> list[UdtMemberDecl]:
+    normalized = normalize_dict_list(members)
+    if not normalized or normalized == [{}]:
+        raise ValueError("At least one UDT member is required")
+    typed_members: list[UdtMemberDecl] = []
+    for member in normalized:
+        typed_members.append(member)
+    return typed_members
+
+
+def _build_udt_decl(name: str, kind: str, members: list[UdtMemberDecl]) -> str:
+    lines = [f"{kind} {name} {{"]
+    expected_offset = 0
+
+    for index, member in enumerate(members):
+        member_name = str(member.get("name", "") or "").strip()
+        member_type = str(member.get("type", "") or "").strip()
+        if not member_name:
+            raise ValueError(f"Member {index} is missing a name")
+        if not member_type:
+            raise ValueError(f"Member {member_name} is missing a type")
+
+        raw_offset = member.get("offset", 0)
+        try:
+            offset = int(raw_offset, 0) if isinstance(raw_offset, str) else int(raw_offset)
+        except Exception as exc:
+            raise ValueError(f"Member {member_name} has invalid offset: {raw_offset!r}") from exc
+        if offset < 0:
+            raise ValueError(f"Member {member_name} offset must be >= 0")
+        if kind == "struct" and offset < expected_offset:
+            raise ValueError(
+                f"Struct member {member_name} offset {offset} is before current layout {expected_offset}"
+            )
+
+        if kind == "struct" and offset > expected_offset:
+            lines.append(f"    char __pad_{expected_offset:x}[{offset - expected_offset}];")
+
+        comment = str(member.get("comment", "") or "")
+        lines.append(
+            f"    {member_type} {member_name};{_format_udt_member_comment(comment)}"
+        )
+
+        if kind == "struct":
+            size = _parse_type_tinfo(member_type).get_size()
+            if size < 0:
+                raise ValueError(
+                    f"Failed to determine size for member {member_name} type {member_type!r}"
+                )
+            expected_offset = offset + size
+
+    lines.append("};")
+    return "\n".join(lines)
+
+
 @tool
 @idasync
 def declare_type(
@@ -177,6 +257,80 @@ def declare_type(
                 results.append({"decl": decl})
         except Exception as e:
             results.append({"decl": decl, "error": str(e)})
+
+    return results
+
+
+@tool
+@idasync
+def declare_udt(
+    queries: Annotated[
+        list[UdtDeclareOp] | UdtDeclareOp,
+        "Create or replace local struct/union declarations from explicit member layouts",
+    ],
+) -> list[DeclareUdtResult]:
+    """Declare local structs or unions from explicit member lists."""
+    queries = normalize_dict_list(queries)
+    results = []
+
+    for query in queries:
+        name = str(query.get("name", "") or "").strip()
+        kind = str(query.get("kind", "") or "").strip().lower()
+        replace = bool(query.get("replace", False))
+
+        try:
+            if not name:
+                raise ValueError("Type name is required")
+            if kind not in {"struct", "union"}:
+                raise ValueError("kind must be 'struct' or 'union'")
+
+            members = _normalize_udt_members(query.get("members"))
+            decl = _build_udt_decl(name, kind, members)
+
+            if replace:
+                ida_typeinf.del_named_type(
+                    ida_typeinf.get_idati(),
+                    name,
+                    ida_typeinf.NTF_TYPE,
+                )
+            elif ida_typeinf.get_named_type_tid(name) != idaapi.BADADDR:
+                raise ValueError(f"Type already exists: {name}")
+
+            flags = ida_typeinf.PT_SIL | ida_typeinf.PT_EMPTY | ida_typeinf.PT_TYP
+            errors, messages = parse_decls_ctypes(decl, flags)
+            if errors > 0:
+                pretty_messages = "\n".join(messages)
+                raise ValueError(f"Failed to parse:\n{pretty_messages}")
+
+            result_members: list[UdtMemberResult] = []
+            for member in members:
+                result_member: UdtMemberResult = {
+                    "name": str(member.get("name", "") or "").strip(),
+                    "type": str(member.get("type", "") or "").strip(),
+                    "offset": int(member.get("offset", 0) or 0),
+                }
+                comment = str(member.get("comment", "") or "")
+                if comment:
+                    result_member["comment"] = comment
+                result_members.append(result_member)
+
+            results.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "decl": decl,
+                    "members": result_members,
+                    "replaced": replace,
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "error": str(e),
+                }
+            )
 
     return results
 

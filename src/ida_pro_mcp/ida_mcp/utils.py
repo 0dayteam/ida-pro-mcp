@@ -407,12 +407,80 @@ class DefineOp(TypedDict, total=False):
     end: Annotated[str, "Optional end address for explicit bounds"]
 
 
+class DefineDataOp(TypedDict):
+    """Define scalar data item."""
+
+    addr: Annotated[str, "Address to define as data (hex or decimal)"]
+    kind: Annotated[
+        str, "Scalar data kind: byte|word|dword|qword|oword|tbyte|float|double"
+    ]
+    force: NotRequired[Annotated[bool, "Undefine overlapping items first when needed"]]
+
+
+class DefineArrayOp(TypedDict):
+    """Define array data item."""
+
+    addr: Annotated[str, "Address to define as array (hex or decimal)"]
+    count: Annotated[int, "Number of elements"]
+    kind: NotRequired[Annotated[
+        str, "Optional scalar element kind: byte|word|dword|qword|oword|tbyte|float|double"
+    ]]
+    force: NotRequired[Annotated[bool, "Undefine overlapping items first when needed"]]
+
+
+class DefineStringOp(TypedDict):
+    """Define string literal."""
+
+    addr: Annotated[str, "Address to define as string (hex or decimal)"]
+    strtype: NotRequired[Annotated[
+        str,
+        "String kind: c|c_16|c_32|pascal|pascal_16|pascal_32|len2|len2_16|len2_32|len4|len4_16|len4_32",
+    ]]
+    length: NotRequired[Annotated[int, "Optional total byte length; omit or 0 for auto"]]
+    force: NotRequired[Annotated[bool, "Undefine overlapping items first when needed"]]
+
+
+class OperandReprOp(TypedDict):
+    """Set operand representation."""
+
+    addr: Annotated[str, "Instruction address (hex or decimal)"]
+    operand: Annotated[int, "Operand index"]
+    action: Annotated[
+        str,
+        "Representation action: hex|dec|oct|bin|char|enum|offset|stackvar|segment|struct_offset|reset",
+    ]
+    enum_name: NotRequired[Annotated[str, "Enum name for enum action"]]
+    offset_base: NotRequired[Annotated[str, "Base address for offset action"]]
+    delta: NotRequired[Annotated[int, "Delta for struct_offset action"]]
+    struct_name: NotRequired[Annotated[str, "Struct name for struct_offset action"]]
+
+
 class UndefineOp(TypedDict, total=False):
     """Undefine operation"""
 
     addr: Annotated[str, "Address to undefine (hex or decimal)"]
     end: Annotated[str, "Optional end address"]
     size: Annotated[int, "Optional size in bytes"]
+
+
+class UdtMemberDecl(TypedDict):
+    """Struct or union member declaration."""
+
+    name: Annotated[str, "Member name"]
+    offset: NotRequired[
+        Annotated[int | str, "Byte offset; required for structs, optional for unions"]
+    ]
+    type: Annotated[str, "Member type declaration"]
+    comment: NotRequired[Annotated[str, "Optional member comment"]]
+
+
+class UdtDeclareOp(TypedDict):
+    """Struct or union declaration."""
+
+    name: Annotated[str, "Type name"]
+    kind: Annotated[str, "struct|union"]
+    members: Annotated[list[UdtMemberDecl] | UdtMemberDecl, "Members in declaration order"]
+    replace: NotRequired[Annotated[bool, "Replace existing local type if present"]]
 
 
 # ============================================================================

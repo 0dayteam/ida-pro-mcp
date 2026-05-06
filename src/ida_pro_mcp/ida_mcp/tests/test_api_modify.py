@@ -8,6 +8,8 @@ from ..framework import (
     assert_error,
     get_any_function,
     get_named_address,
+    get_data_address,
+    get_any_string,
 )
 from ..api_modify import (
     append_comments,
@@ -16,10 +18,15 @@ from ..api_modify import (
     rename,
     define_func,
     define_code,
+    define_data,
+    define_array,
+    define_string,
+    set_operand_repr,
     undefine,
 )
 from ..api_memory import get_bytes, patch
 from ..api_core import lookup_funcs
+from ..api_types import set_type
 from ..arm64_branch_patch import assemble_supported_arm64_branch
 
 
@@ -29,6 +36,9 @@ CRACKME_FRAME_DUMMY = "0x11a0"
 TYPED_FIXTURE_IMMEDIATE_1234 = "0x1013e44"
 TYPED_FIXTURE_USE_WRAPPER = "0x1013dc0"
 TYPED_FIXTURE_LOCAL_NAME = "rhs_handle"
+TYPED_FIXTURE_G_POINT = "0x1069f70"
+TYPED_FIXTURE_G_WRAPPER = "0x1069f80"
+TYPED_FIXTURE_INFER_FALLBACK = "0x1069fa4"
 ARM64_PATCH_FIXTURE_BRANCH_SITE = "branch_site"
 ARM64_PATCH_FIXTURE_ALTERNATE_TARGET = "alternate_target"
 
@@ -482,6 +492,92 @@ def test_define_code_on_existing_code():
         or result.get("length") is not None
         or result.get("error") is not None
     )
+
+
+@test(binary="typed_fixture.elf")
+def test_define_data_force_replaces_existing_item():
+    """define_data(force=true) can redefine an existing global item as a scalar."""
+    addr = TYPED_FIXTURE_G_POINT
+    try:
+        result = define_data({"addr": addr, "kind": "qword", "force": True})[0]
+        assert "error" not in result
+        assert result["kind"] == "qword"
+        assert result["size"] == 8
+    finally:
+        set_type({"addr": addr, "kind": "global", "ty": "Point"})
+
+
+@test(binary="typed_fixture.elf")
+def test_define_data_existing_item_requires_force():
+    """define_data without force should reject overwriting an existing item."""
+    result = define_data({"addr": TYPED_FIXTURE_G_WRAPPER, "kind": "byte"})[0]
+    assert_error(result, contains="force=true")
+
+
+@test(binary="typed_fixture.elf")
+def test_define_array_from_scalar_kind():
+    """define_array can create a scalar byte array when kind is supplied."""
+    addr = TYPED_FIXTURE_INFER_FALLBACK
+    try:
+        result = define_array({"addr": addr, "count": 4, "kind": "byte", "force": True})[0]
+        assert "error" not in result
+        assert result["size"] == 4
+        assert result["count"] == 4
+        assert result["kind"] == "byte"
+    finally:
+        undefine({"addr": addr, "size": 4})
+
+
+@test()
+def test_define_array_requires_kind_or_existing_item():
+    """define_array should reject unknown bytes when no base item exists."""
+    data_addr = get_data_address()
+    if not data_addr:
+        skip_test("binary has no data segment")
+
+    undefine({"addr": data_addr, "size": 4})
+    result = define_array({"addr": data_addr, "count": 4})[0]
+    assert_error(result, contains="provide kind")
+
+
+@test()
+def test_define_string_roundtrip_on_existing_string():
+    """define_string can recreate a string literal after undefining it."""
+    import idc
+
+    addr = get_any_string()
+    if not addr:
+        skip_test("binary has no strings")
+
+    original = idc.get_strlit_contents(int(addr, 16), -1, 0)
+    if not original:
+        skip_test("failed to read original string")
+
+    undefine({"addr": addr, "size": len(original) + 1})
+    try:
+        result = define_string({"addr": addr, "strtype": "c"})[0]
+        assert "error" not in result
+        restored = idc.get_strlit_contents(int(addr, 16), -1, 0)
+        assert restored == original
+    finally:
+        define_string({"addr": addr, "strtype": "c", "force": True})
+
+
+@test(binary="typed_fixture.elf")
+def test_set_operand_repr_decimal_changes_immediate_rendering():
+    """set_operand_repr(dec) should switch an immediate operand to decimal display."""
+    import idc
+
+    addr = int(TYPED_FIXTURE_IMMEDIATE_1234, 16)
+    before = idc.print_operand(addr, 1)
+    try:
+        result = set_operand_repr({"addr": hex(addr), "operand": 1, "action": "dec"})[0]
+        assert "error" not in result
+        after = idc.print_operand(addr, 1)
+        assert after == "4660"
+        assert after != before
+    finally:
+        set_operand_repr({"addr": hex(addr), "operand": 1, "action": "reset"})
 
 
 @test(binary="typed_fixture.elf")
