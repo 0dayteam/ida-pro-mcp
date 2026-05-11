@@ -116,6 +116,53 @@ def test_declare_udt_creates_struct_with_padding():
 
 
 @test()
+def test_declare_udt_supports_array_member_types():
+    """declare_udt should render array members in C declaration order."""
+    result = declare_udt(
+        {
+            "name": "__DeclareUdtArrayMember__",
+            "kind": "struct",
+            "replace": True,
+            "members": [
+                {"name": "prefix", "offset": 0, "type": "int"},
+                {"name": "words", "offset": 8, "type": "_QWORD[3]"},
+            ],
+        }
+    )
+    assert_is_list(result, min_length=1)
+    assert "error" not in result[0]
+    assert "words[3]" in result[0]["decl"]
+
+    inspected = type_inspect({"name": "__DeclareUdtArrayMember__", "include_members": True})[0]
+    assert inspected["exists"] is True
+    assert inspected["member_count"] == 3
+    assert inspected["members"][-1]["name"] == "words"
+
+
+@test()
+def test_declare_udt_accepts_hex_string_offsets():
+    """declare_udt should accept hex string offsets from MCP callers."""
+    result = declare_udt(
+        {
+            "name": "__DeclareUdtHexOffset__",
+            "kind": "struct",
+            "replace": True,
+            "members": [
+                {"name": "a", "offset": "0x0", "type": "int"},
+                {"name": "b", "offset": "0x10", "type": "char"},
+            ],
+        }
+    )
+    assert_is_list(result, min_length=1)
+    assert "error" not in result[0]
+    assert result[0]["members"][1]["offset"] == 16
+
+    inspected = type_inspect({"name": "__DeclareUdtHexOffset__", "include_members": True})[0]
+    assert inspected["exists"] is True
+    assert inspected["members"][-1]["offset"] == "0x10"
+
+
+@test()
 def test_declare_udt_replace_overwrites_existing_layout():
     """declare_udt(replace=true) should replace the whole local type layout."""
     first = declare_udt(

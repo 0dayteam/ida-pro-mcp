@@ -203,6 +203,31 @@ class DispatchProxyTransportTests(unittest.TestCase):
             server._proxy_to_ida(b"{}")
         self.assertEqual((_RecordingConnection.instances[0].host, _RecordingConnection.instances[0].port), ("127.0.0.1", 15555))
 
+    def test_list_tools_tool_is_handled_locally_when_ida_unreachable(self):
+        server.IDA_HOST = "127.0.0.1"
+        server.IDA_PORT = 1
+        request = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "list_tools", "arguments": {}},
+            "id": 1,
+        }
+
+        response = server.dispatch_proxy(request)
+
+        self.assertIsNotNone(response)
+        self.assertIn("result", response)
+        structured = response["result"].get("structuredContent", {})
+        self.assertIn("tools", structured)
+        self.assertIn("total", structured)
+        tool_names = {tool["name"] for tool in structured["tools"]}
+        self.assertIn("list_tools", tool_names)
+        self.assertIn("list_instances", tool_names)
+        self.assertIn("select_instance", tool_names)
+        self.assertEqual(structured["active_host"], "127.0.0.1")
+        self.assertEqual(structured["active_port"], 1)
+        self.assertEqual(structured["total"], len(structured["tools"]))
+
     def test_dispatch_proxy_does_not_retry_post_send_failures(self):
         request = {"jsonrpc": "2.0", "method": "tools/call", "params": {}, "id": 1}
         with patch("ida_pro_mcp.server.http.client.HTTPConnection", _ResponseFailureConnection):

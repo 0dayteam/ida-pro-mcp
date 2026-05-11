@@ -47,9 +47,8 @@ _state: dict[str, Any] = {
 }
 
 
-@idasync
-def _netnode_flush_segment(payload: bytes, record_count: int) -> None:
-    """Write one segment and bump meta counters atomically on the IDA main thread."""
+def _netnode_flush_segment_main_thread(payload: bytes, record_count: int) -> None:
+    """Write one segment and bump meta counters on the current IDA main thread."""
     import ida_netnode
 
     node = ida_netnode.netnode(IDB_NETNODE_NAME, 0, True)
@@ -74,6 +73,12 @@ def _netnode_flush_segment(payload: bytes, record_count: int) -> None:
 
     cur_total = node.altval(_META_TOTAL_RECORDS, _TAG_META)
     node.altset(_META_TOTAL_RECORDS, cur_total + record_count, _TAG_META)
+
+
+@idasync
+def _netnode_flush_segment(payload: bytes, record_count: int) -> None:
+    """Write one segment and bump meta counters atomically on the IDA main thread."""
+    _netnode_flush_segment_main_thread(payload, record_count)
 
 
 @idasync
@@ -127,7 +132,7 @@ class NetnodeBackend:
         if flush_now:
             self.flush()
 
-    def flush(self) -> None:
+    def flush(self, *, already_on_main_thread: bool = False) -> None:
         with self._flush_lock:
             with self._lock:
                 if not self._buffer:
@@ -138,7 +143,10 @@ class NetnodeBackend:
             payload = b"\n".join(to_flush) + b"\n"
             compressed = gzip.compress(payload, mtime=0)
             try:
-                _netnode_flush_segment(compressed, len(to_flush))
+                if already_on_main_thread:
+                    _netnode_flush_segment_main_thread(compressed, len(to_flush))
+                else:
+                    _netnode_flush_segment(compressed, len(to_flush))
             except Exception:
                 # Re-prepend the failed batch so retries keep wall-clock order.
                 with self._lock:
@@ -192,7 +200,9 @@ def _install_idb_hook() -> None:
             b = backend_ref.get("idb_backend")
             if b is not None:
                 try:
-                    b.flush()
+                    # savebase already runs on IDA's main thread; avoid
+                    # re-entering execute_sync() from inside the save callback.
+                    b.flush(already_on_main_thread=True)
                 except Exception:
                     pass
             return 0
@@ -201,7 +211,8 @@ def _install_idb_hook() -> None:
             b = backend_ref.get("idb_backend")
             if b is not None:
                 try:
-                    b.flush()
+                    # closebase has the same main-thread callback context as savebase.
+                    b.flush(already_on_main_thread=True)
                 except Exception:
                     pass
             return 0

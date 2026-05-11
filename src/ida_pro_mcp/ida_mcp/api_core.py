@@ -11,8 +11,9 @@ import idaapi
 import ida_funcs
 import ida_hexrays
 import ida_lines
-import ida_search
+import ida_name
 import ida_segment
+import ida_ua
 import idautils
 import ida_loader
 import ida_nalt
@@ -886,58 +887,114 @@ def find_regex(
     }
 
 
-_COMMENT_SCOLORS = (
-    ida_lines.SCOLOR_REGCMT,
-    ida_lines.SCOLOR_RPTCMT,
-    ida_lines.SCOLOR_AUTOCMT,
-    ida_lines.SCOLOR_COLLAPSED,
-)
+def _normalize_search_line(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def _line_is_comment(tagged: str) -> bool:
-    """A rendered listing line is a comment if it carries any comment SCOLOR tag."""
-    if not tagged:
-        return False
-    for sc in _COMMENT_SCOLORS:
-        if ida_lines.COLOR_ON + sc in tagged:
-            return True
-    return False
+def _collect_comment_lines(ea: int) -> list[SearchTextLine]:
+    out: list[SearchTextLine] = []
+    idx = 0
+    while True:
+        line = ida_lines.get_extra_cmt(ea, ida_lines.E_PREV + idx)
+        if line is None:
+            break
+        text = _normalize_search_line(ida_lines.tag_remove(line) or "")
+        if text:
+            out.append({"kind": "comment", "text": text})
+        idx += 1
+    cmt = ida_bytes.get_cmt(ea, False)
+    if cmt:
+        text = _normalize_search_line(cmt)
+        if text:
+            out.append({"kind": "comment", "text": text})
+    rcmt = ida_bytes.get_cmt(ea, True)
+    if rcmt and rcmt != cmt:
+        text = _normalize_search_line(rcmt)
+        if text:
+            out.append({"kind": "comment", "text": text})
+    idx = 0
+    while True:
+        line = ida_lines.get_extra_cmt(ea, ida_lines.E_NEXT + idx)
+        if line is None:
+            break
+        text = _normalize_search_line(ida_lines.tag_remove(line) or "")
+        if text:
+            out.append({"kind": "comment", "text": text})
+        idx += 1
+    return out
 
 
-def _classify_hit_lines(
+def _collect_disasm_lines(ea: int) -> list[SearchTextLine]:
+    out: list[SearchTextLine] = []
+    flags = ida_bytes.get_flags(ea)
+    if ida_bytes.is_code(flags):
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, ea) <= 0:
+            return out
+        parts: list[str] = []
+        mnem = _normalize_search_line(ida_ua.print_insn_mnem(ea) or "")
+        if mnem:
+            parts.append(mnem)
+        operands: list[str] = []
+        max_ops = getattr(ida_ua, "UA_MAXOP", 8)
+        for idx in range(max_ops):
+            if insn.ops[idx].type == ida_ua.o_void:
+                break
+            operand = _normalize_search_line(ida_ua.print_operand(ea, idx) or "")
+            if operand:
+                operands.append(operand)
+        if operands:
+            parts.append(", ".join(operands))
+        text = _normalize_search_line(" ".join(parts))
+        if text:
+            out.append({"kind": "disasm", "text": text})
+        return out
+
+    name = _normalize_search_line(ida_name.get_ea_name(ea) or "")
+    if name:
+        out.append({"kind": "disasm", "text": name})
+
+    size = ida_bytes.get_item_size(ea)
+    if size <= 0:
+        size = 1
+    raw = ida_bytes.get_bytes(ea, size) or b""
+    if raw:
+        spaced_hex = " ".join(f"{b:02X}" for b in raw)
+        compact_hex = raw.hex().upper()
+        out.append({"kind": "disasm", "text": spaced_hex})
+        if compact_hex != spaced_hex.replace(" ", ""):
+            out.append({"kind": "disasm", "text": compact_hex})
+
+    if ida_bytes.is_strlit(flags):
+        strtype = ida_nalt.get_str_type(ea)
+        str_bytes = ida_bytes.get_strlit_contents(ea, size, strtype)
+        if str_bytes:
+            try:
+                text = str_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                text = str(str_bytes)
+            text = _normalize_search_line(text)
+            if text:
+                out.append({"kind": "disasm", "text": text})
+    return out
+
+
+def _collect_searchable_lines(
     ea: int,
     matcher,
     want_disasm: bool,
     want_comments: bool,
-    max_lines: int = 32,
 ) -> list[SearchTextLine]:
-    """Render the listing for `ea` once, classify each line, return matching lines."""
     out: list[SearchTextLine] = []
-    try:
-        result = ida_lines.generate_disassembly(ea, max_lines, False, False)
-    except Exception:
-        return out
-    # Bindings vary: (n, lineno, lines) or (lines, lineno).
-    lines = None
-    if isinstance(result, tuple):
-        for item in result:
-            if isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
-                lines = list(item)
-                break
-    if lines is None:
-        return out
-
-    for tagged in lines:
-        text = ida_lines.tag_remove(tagged) or ""
-        if not text or not matcher(text):
-            continue
-        is_cmt = _line_is_comment(tagged)
-        kind = "comment" if is_cmt else "disasm"
-        if kind == "disasm" and not want_disasm:
-            continue
-        if kind == "comment" and not want_comments:
-            continue
-        out.append({"kind": kind, "text": text})
+    candidates: list[SearchTextLine] = []
+    if want_disasm:
+        candidates.extend(_collect_disasm_lines(ea))
+    if want_comments:
+        candidates.extend(_collect_comment_lines(ea))
+    for entry in candidates:
+        text = entry.get("text", "")
+        if text and matcher(text):
+            out.append(entry)
     return out
 
 
@@ -971,23 +1028,30 @@ def _segment_index_for_ea_or_next(segments: list[tuple[int, int]], ea: int) -> i
     return len(segments)
 
 
+def _first_search_head(start_ea: int, end_ea: int) -> int:
+    if start_ea >= end_ea:
+        return idaapi.BADADDR
+    if ida_bytes.is_head(ida_bytes.get_flags(start_ea)):
+        return start_ea
+    return ida_bytes.next_head(start_ea, end_ea)
+
+
+def _next_search_head(ea: int, end_ea: int) -> int:
+    return ida_bytes.next_head(ea, end_ea)
+
+
 @tool
 @idasync
 def search_text(
-    pattern: Annotated[str, "Text to search for in the rendered listing (literal substring by default)"],
+    pattern: Annotated[str, "Text to search for in item text assembled from IDA APIs"],
     limit: Annotated[int, "Max hits per page (default: 30, max: 500)"] = 30,
     start: Annotated[str, "Cursor: address to resume from (hex or symbol). Empty = first segment."] = "",
-    regex: Annotated[bool, "Treat pattern as a regex (uses IDA's SEARCH_REGEX)"] = False,
+    regex: Annotated[bool, "Treat pattern as a regex"] = False,
     case_sensitive: Annotated[bool, "Case-sensitive match (default: false)"] = False,
     include: Annotated[str, "'disasm' | 'comments' | 'all' (default: all)"] = "all",
     code_only: Annotated[bool, "Restrict search to executable segments (default: true)"] = True,
 ) -> SearchTextResult:
-    """Search the rendered listing using IDA's native text search (fast C++ scan).
-
-    Discovers candidate EAs with `ida_search.find_text()`, then renders each hit
-    once via `ida_lines.generate_disassembly()` to extract matching lines and
-    classify them as disasm or comment. Returns one hit per EA.
-    """
+    """Search text extracted directly from IDA item metadata, not rendered listings."""
     if limit <= 0:
         limit = 30
     if limit > 500:
@@ -1000,7 +1064,7 @@ def search_text(
     want_disasm = include in ("disasm", "all")
     want_comments = include in ("comments", "all")
 
-    # Build a Python-side matcher for per-line filtering after the C++ find.
+    # Build a Python-side matcher for per-line filtering.
     if regex:
         try:
             flags = 0 if case_sensitive else re.IGNORECASE
@@ -1015,13 +1079,6 @@ def search_text(
         else:
             needle = pattern.lower()
             matcher = lambda s: needle in s.lower()
-
-    # Build IDA search flags.
-    sflag = ida_search.SEARCH_DOWN | ida_search.SEARCH_NOSHOW
-    if case_sensitive:
-        sflag |= ida_search.SEARCH_CASE
-    if regex:
-        sflag |= ida_search.SEARCH_REGEX
 
     # Resolve cursor.
     segments = _exec_segments() if code_only else _all_segments()
@@ -1044,55 +1101,32 @@ def search_text(
 
     while seg_idx < len(segments) and len(hits) < limit:
         seg_start, seg_end = segments[seg_idx]
-        ea = ida_search.find_text(cursor_ea, 0, 0, pattern, sflag)
-        if ea == idaapi.BADADDR:
-            # find_text scans forward to the end of the IDB. A miss here means
-            # there cannot be any later hits, so avoid rescanning every segment tail.
-            break
-        if ea >= seg_end:
-            # find_text is not segment-bounded; jump directly to the segment that
-            # contains the hit (or the next segment after it) instead of rescanning
-            # each intermediate segment from scratch.
-            next_idx = _segment_index_for_ea_or_next(segments, ea)
-            if next_idx >= len(segments):
-                break
-            seg_idx = next_idx
-            next_start, _ = segments[seg_idx]
-            cursor_ea = ea if ea >= next_start else next_start
-            continue
-        if ea < seg_start:
-            next_idx = _segment_index_for_ea_or_next(segments, ea)
-            if next_idx >= len(segments):
-                break
-            seg_idx = next_idx
-            next_start, _ = segments[seg_idx]
-            cursor_ea = ea if ea >= next_start else next_start
-            continue
-
-        lines = _classify_hit_lines(ea, matcher, want_disasm, want_comments)
-        if lines:
-            entry: SearchTextHit = {"addr": hex(ea), "matches": lines}
-            func = idaapi.get_func(ea)
-            if func is not None:
-                fname = ida_funcs.get_func_name(func.start_ea)
-                if fname:
-                    entry["function"] = fname
-            seg = idaapi.getseg(ea)
-            if seg is not None:
-                sname = ida_segment.get_segm_name(seg)
-                if sname:
-                    entry["segment"] = sname
-            hits.append(entry)
-            if len(hits) >= limit:
-                # Compute resume cursor: just past this hit.
-                size = max(1, idaapi.get_item_size(ea))
-                next_cursor = ea + size
-                break
-
-        # Advance past this match. Use item size if known to avoid re-hitting
-        # the same head's listing on the next iteration.
-        size = idaapi.get_item_size(ea)
-        cursor_ea = ea + (size if size > 0 else 1)
+        if cursor_ea < seg_start:
+            cursor_ea = seg_start
+        ea = _first_search_head(cursor_ea, seg_end)
+        while ea != idaapi.BADADDR and ea < seg_end and len(hits) < limit:
+            lines = _collect_searchable_lines(ea, matcher, want_disasm, want_comments)
+            if lines:
+                entry: SearchTextHit = {"addr": hex(ea), "matches": lines}
+                func = idaapi.get_func(ea)
+                if func is not None:
+                    fname = ida_funcs.get_func_name(func.start_ea)
+                    if fname:
+                        entry["function"] = fname
+                seg = idaapi.getseg(ea)
+                if seg is not None:
+                    sname = ida_segment.get_segm_name(seg)
+                    if sname:
+                        entry["segment"] = sname
+                hits.append(entry)
+                if len(hits) >= limit:
+                    size = max(1, idaapi.get_item_size(ea))
+                    next_cursor = ea + size
+                    break
+            ea = _next_search_head(ea, seg_end)
+        seg_idx += 1
+        if seg_idx < len(segments):
+            cursor_ea = segments[seg_idx][0]
 
     cursor: dict[str, Any]
     if next_cursor is not None:

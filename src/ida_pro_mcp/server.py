@@ -76,6 +76,20 @@ class ProxySelectResult(TypedDict, total=False):
     error: str
 
 
+class ProxyToolInfo(TypedDict, total=False):
+    name: str
+    description: str
+    inputSchema: dict[str, object]
+    outputSchema: dict[str, object]
+
+
+class ProxyToolsListResult(TypedDict):
+    tools: list[ProxyToolInfo]
+    total: int
+    active_host: str
+    active_port: int
+
+
 DEFAULT_IDA_HOST = "127.0.0.1"
 DEFAULT_IDA_PORT = 13337
 IDA_HOST = DEFAULT_IDA_HOST
@@ -84,7 +98,7 @@ IDA_PORT = DEFAULT_IDA_PORT
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
 
-LOCAL_TOOLS = {"list_instances", "select_instance"}
+LOCAL_TOOLS = {"list_instances", "select_instance", "list_tools"}
 OUTPUT_PROXY_CACHE_MAX_SIZE = 100
 _OUTPUT_PATH_RE = re.compile(r"^/output/([a-f0-9-]+)\.(\w+)$")
 _output_proxy_targets: OrderedDict[str, tuple[str, int]] = OrderedDict()
@@ -278,6 +292,42 @@ def _proxy_to_ida(payload: bytes | str | dict) -> dict:
     return _proxy_to_instance(host, port, payload)
 
 
+def _get_merged_tools_response(
+    request: JsonRpcRequest | None = None,
+) -> JsonRpcResponse | None:
+    """Return the merged tools/list response for local and active IDA tools."""
+    request_obj: JsonRpcRequest = request or {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "tools/list",
+        "params": {},
+    }
+
+    local_result = dispatch_original(request_obj)
+    local_tool_names = (
+        {t["name"] for t in local_result.get("result", {}).get("tools", [])}
+        if local_result
+        else set()
+    )
+
+    try:
+        ida_result = _proxy_to_ida(request_obj)
+        if ida_result and "result" in ida_result:
+            ida_tools = [
+                t
+                for t in ida_result["result"].get("tools", [])
+                if t.get("name") not in local_tool_names
+            ]
+            if local_result and "result" in local_result:
+                local_result["result"]["tools"] = (
+                    ida_tools + local_result["result"].get("tools", [])
+                )
+    except Exception:
+        pass
+
+    return local_result
+
+
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
     """Dispatch JSON-RPC requests to the MCP server registry."""
     if not isinstance(request, dict):
@@ -299,30 +349,7 @@ def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse |
 
     # Handle tools/list locally: always include local tools, merge IDA tools when available
     if request_obj["method"] == "tools/list":
-        # Get local tools (always available)
-        local_result = dispatch_original(request)
-        local_tool_names = (
-            {t["name"] for t in local_result.get("result", {}).get("tools", [])}
-            if local_result
-            else set()
-        )
-        # Try to get IDA tools and merge them in
-        try:
-            ida_result = _proxy_to_ida(request)
-            if ida_result and "result" in ida_result:
-                # Filter out IDA tools that duplicate local tools (e.g. select_instance)
-                ida_tools = [
-                    t
-                    for t in ida_result["result"].get("tools", [])
-                    if t.get("name") not in local_tool_names
-                ]
-                if local_result and "result" in local_result:
-                    local_result["result"]["tools"] = (
-                        ida_tools + local_result["result"].get("tools", [])
-                    )
-        except Exception:
-            pass  # IDA unreachable — local tools still work
-        return local_result
+        return _get_merged_tools_response(request_obj)
 
     try:
         return _proxy_to_ida(request)
@@ -431,6 +458,28 @@ def select_instance(
         return {"success": False, "error": f"Instance at {host}:{port} is not reachable"}
     _set_active_ida_target(host, port)
     return {"success": True, "host": host, "port": port}
+
+
+@mcp.tool
+def list_tools() -> ProxyToolsListResult:
+    """List MCP tools currently exposed by this proxy server.
+
+    This returns the same merged catalog the MCP `tools/list` endpoint exposes:
+    local proxy tools plus any tools reachable from the active IDA instance.
+    Use this when agent-side tool discovery is incomplete or when you need a
+    callable tool that can enumerate the current tool surface.
+    """
+    active_host, active_port = _get_active_ida_target()
+    response = _get_merged_tools_response()
+    tools = []
+    if response and "result" in response:
+        tools = response["result"].get("tools", [])
+    return {
+        "tools": tools,
+        "total": len(tools),
+        "active_host": active_host,
+        "active_port": active_port,
+    }
 
 
 # ============================================================================

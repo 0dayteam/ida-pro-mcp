@@ -197,6 +197,47 @@ def test_trace_idb_shutdown_flushes_pending_buffer():
 
 
 @test()
+def test_trace_idb_savebase_flush_bypasses_idasync_wrapper():
+    """savebase callback must flush directly on the main thread."""
+    _reset_trace(batch_records=100)
+    try:
+        _call_through_registry("server_health", {})
+        backend = trace._state["idb_backend"]
+        hook = trace._state["idb_hook"]
+        assert backend is not None
+        assert hook is not None
+        assert _read_stats()["segments"] == 0
+
+        original_direct = trace._netnode_flush_segment_main_thread
+        original_wrapped = trace._netnode_flush_segment
+        direct_calls: list[tuple[int, int]] = []
+
+        def fake_direct(payload: bytes, record_count: int) -> None:
+            direct_calls.append((len(payload), record_count))
+            return original_direct(payload, record_count)
+
+        def fail_wrapped(payload: bytes, record_count: int) -> None:
+            raise AssertionError(
+                "savebase flush should not re-enter the @idasync wrapper"
+            )
+
+        trace._netnode_flush_segment_main_thread = fake_direct
+        trace._netnode_flush_segment = fail_wrapped
+        try:
+            hook.savebase()
+        finally:
+            trace._netnode_flush_segment_main_thread = original_direct
+            trace._netnode_flush_segment = original_wrapped
+
+        assert direct_calls, "expected direct main-thread flush during savebase"
+        records = list(trace.iter_idb_records())
+        assert len(records) == 1
+        assert records[0]["tool"] == "server_health"
+    finally:
+        _teardown_trace()
+
+
+@test()
 def test_trace_idb_records_duration_and_timestamp_shape():
     """Each record has numeric duration_ms and ISO-8601 UTC timestamp."""
     _reset_trace(batch_records=1)

@@ -1,3 +1,4 @@
+import re
 from typing import Annotated, Any, NotRequired, TypedDict
 
 import idc
@@ -180,14 +181,43 @@ def _format_udt_member_comment(comment: str) -> str:
     return " /* " + " | ".join(lines) + " */"
 
 
+def _parse_udt_offset(raw_offset: object, member_name: str) -> int:
+    try:
+        return int(raw_offset, 0) if isinstance(raw_offset, str) else int(raw_offset)
+    except Exception as exc:
+        raise ValueError(
+            f"Member {member_name} has invalid offset: {raw_offset!r}"
+        ) from exc
+
+
 def _normalize_udt_members(members: list[UdtMemberDecl] | UdtMemberDecl | object) -> list[UdtMemberDecl]:
     normalized = normalize_dict_list(members)
     if not normalized or normalized == [{}]:
         raise ValueError("At least one UDT member is required")
     typed_members: list[UdtMemberDecl] = []
-    for member in normalized:
-        typed_members.append(member)
+    for index, member in enumerate(normalized):
+        normalized_member = dict(member)
+        raw_offset = normalized_member.get("offset", 0)
+        member_name = str(normalized_member.get("name", "") or "").strip() or f"#{index}"
+        normalized_member["offset"] = _parse_udt_offset(raw_offset, member_name)
+        typed_members.append(normalized_member)
     return typed_members
+
+
+def _render_udt_member_decl(member_type: str, member_name: str) -> str:
+    base_type = member_type.strip()
+    array_suffix = ""
+
+    # IDA accepts array types in tinfo parsing (for sizing) but UDT member declarations
+    # still need C layout syntax: `T name[n]`, not `T[n] name`.
+    while True:
+        match = re.search(r"\s*(\[[^\[\]]*\])\s*$", base_type)
+        if match is None:
+            break
+        array_suffix = match.group(1) + array_suffix
+        base_type = base_type[: match.start()].rstrip()
+
+    return f"{base_type} {member_name}{array_suffix};"
 
 
 def _build_udt_decl(name: str, kind: str, members: list[UdtMemberDecl]) -> str:
@@ -203,10 +233,7 @@ def _build_udt_decl(name: str, kind: str, members: list[UdtMemberDecl]) -> str:
             raise ValueError(f"Member {member_name} is missing a type")
 
         raw_offset = member.get("offset", 0)
-        try:
-            offset = int(raw_offset, 0) if isinstance(raw_offset, str) else int(raw_offset)
-        except Exception as exc:
-            raise ValueError(f"Member {member_name} has invalid offset: {raw_offset!r}") from exc
+        offset = _parse_udt_offset(raw_offset, member_name)
         if offset < 0:
             raise ValueError(f"Member {member_name} offset must be >= 0")
         if kind == "struct" and offset < expected_offset:
@@ -218,9 +245,7 @@ def _build_udt_decl(name: str, kind: str, members: list[UdtMemberDecl]) -> str:
             lines.append(f"    char __pad_{expected_offset:x}[{offset - expected_offset}];")
 
         comment = str(member.get("comment", "") or "")
-        lines.append(
-            f"    {member_type} {member_name};{_format_udt_member_comment(comment)}"
-        )
+        lines.append(f"    {_render_udt_member_decl(member_type, member_name)}{_format_udt_member_comment(comment)}")
 
         if kind == "struct":
             size = _parse_type_tinfo(member_type).get_size()

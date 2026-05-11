@@ -559,50 +559,59 @@ def test_search_text_regex_mode():
 
 
 @test()
-def test_search_text_badaddr_stops_without_rescanning_every_segment():
-    """A miss after the current cursor should terminate immediately."""
+def test_search_text_empty_segments_terminate_cleanly():
+    """Segments with no heads should produce an empty result without errors."""
     original_exec_segments = api_core._exec_segments
-    original_find_text = api_core.ida_search.find_text
+    original_first_head = api_core._first_search_head
     try:
         calls = []
-        api_core._exec_segments = lambda: [(0x1000, 0x1100), (0x2000, 0x2100), (0x3000, 0x3100)]
+        api_core._exec_segments = lambda: [(0x1000, 0x1100), (0x2000, 0x2100)]
 
-        def fake_find_text(start_ea, _y, _x, pattern, _sflag):
-            calls.append((start_ea, pattern))
+        def fake_first_head(start_ea, end_ea):
+            calls.append((start_ea, end_ea))
             return idaapi.BADADDR
 
-        api_core.ida_search.find_text = fake_find_text
+        api_core._first_search_head = fake_first_head
         result = search_text("never-hits", limit=5)
     finally:
         api_core._exec_segments = original_exec_segments
-        api_core.ida_search.find_text = original_find_text
+        api_core._first_search_head = original_first_head
 
     assert result["n"] == 0
     assert result["cursor"].get("done") is True
-    assert calls == [(0x1000, "never-hits")]
+    assert calls == [(0x1000, 0x1100), (0x2000, 0x2100)]
 
 
 @test()
-def test_search_text_jumps_directly_to_later_exec_segment():
-    """A hit in a later exec segment should not force rescanning intermediate tails."""
+def test_search_text_walks_heads_and_sets_resume_cursor():
+    """The implementation walks item heads and paginates from item size."""
     original_exec_segments = api_core._exec_segments
-    original_find_text = api_core.ida_search.find_text
-    original_classify = api_core._classify_hit_lines
+    original_first_head = api_core._first_search_head
+    original_next_head = api_core._next_search_head
+    original_collect = api_core._collect_searchable_lines
     original_item_size = api_core.idaapi.get_item_size
     original_get_func = api_core.idaapi.get_func
     original_getseg = api_core.idaapi.getseg
     try:
-        calls = []
+        first_calls = []
+        next_calls = []
         api_core._exec_segments = lambda: [(0x1000, 0x1100), (0x2000, 0x2100), (0x3000, 0x3100)]
 
-        sequence = iter([0x3004, idaapi.BADADDR])
+        def fake_first_head(start_ea, end_ea):
+            first_calls.append((start_ea, end_ea))
+            if start_ea == 0x3000:
+                return 0x3004
+            return idaapi.BADADDR
 
-        def fake_find_text(start_ea, _y, _x, pattern, _sflag):
-            calls.append((start_ea, pattern))
-            return next(sequence)
+        def fake_next_head(ea, end_ea):
+            next_calls.append((ea, end_ea))
+            return idaapi.BADADDR
 
-        api_core.ida_search.find_text = fake_find_text
-        api_core._classify_hit_lines = lambda ea, *_args, **_kwargs: [{"kind": "disasm", "text": f"match@{ea:x}"}]
+        api_core._first_search_head = fake_first_head
+        api_core._next_search_head = fake_next_head
+        api_core._collect_searchable_lines = (
+            lambda ea, *_args, **_kwargs: [{"kind": "disasm", "text": f"match@{ea:x}"}]
+        )
         api_core.idaapi.get_item_size = lambda _ea: 4
         api_core.idaapi.get_func = lambda _ea: None
         api_core.idaapi.getseg = lambda _ea: None
@@ -610,8 +619,9 @@ def test_search_text_jumps_directly_to_later_exec_segment():
         result = search_text("late-hit", limit=1)
     finally:
         api_core._exec_segments = original_exec_segments
-        api_core.ida_search.find_text = original_find_text
-        api_core._classify_hit_lines = original_classify
+        api_core._first_search_head = original_first_head
+        api_core._next_search_head = original_next_head
+        api_core._collect_searchable_lines = original_collect
         api_core.idaapi.get_item_size = original_item_size
         api_core.idaapi.get_func = original_get_func
         api_core.idaapi.getseg = original_getseg
@@ -619,4 +629,44 @@ def test_search_text_jumps_directly_to_later_exec_segment():
     assert result["n"] == 1
     assert result["hits"][0]["addr"] == "0x3004"
     assert result["cursor"].get("next") == "0x3008"
-    assert calls == [(0x1000, "late-hit"), (0x3004, "late-hit")]
+    assert first_calls == [(0x1000, 0x1100), (0x2000, 0x2100), (0x3000, 0x3100)]
+    assert next_calls == []
+
+
+@test()
+def test_collect_disasm_lines_skips_non_strings_with_invalid_strtype_sentinel():
+    """Non-string items must not call get_strlit_contents() on IDA's 0xFFFFFFFF sentinel."""
+    original_get_flags = api_core.ida_bytes.get_flags
+    original_is_code = api_core.ida_bytes.is_code
+    original_get_item_size = api_core.ida_bytes.get_item_size
+    original_get_bytes = api_core.ida_bytes.get_bytes
+    original_is_strlit = api_core.ida_bytes.is_strlit
+    original_get_str_type = api_core.ida_nalt.get_str_type
+    original_get_strlit_contents = api_core.ida_bytes.get_strlit_contents
+    original_get_ea_name = api_core.ida_name.get_ea_name
+    try:
+        api_core.ida_bytes.get_flags = lambda _ea: 0
+        api_core.ida_bytes.is_code = lambda _flags: False
+        api_core.ida_bytes.get_item_size = lambda _ea: 4
+        api_core.ida_bytes.get_bytes = lambda _ea, _size: b"\xF2\xF7\x0C\x00"
+        api_core.ida_bytes.is_strlit = lambda _flags: False
+        api_core.ida_nalt.get_str_type = lambda _ea: 0xFFFFFFFF
+        api_core.ida_name.get_ea_name = lambda _ea: ""
+
+        def fail_get_strlit_contents(_ea, _length, _strtype):
+            raise AssertionError("get_strlit_contents should not be called for non-string items")
+
+        api_core.ida_bytes.get_strlit_contents = fail_get_strlit_contents
+
+        result = api_core._collect_disasm_lines(0x1000)
+    finally:
+        api_core.ida_bytes.get_flags = original_get_flags
+        api_core.ida_bytes.is_code = original_is_code
+        api_core.ida_bytes.get_item_size = original_get_item_size
+        api_core.ida_bytes.get_bytes = original_get_bytes
+        api_core.ida_bytes.is_strlit = original_is_strlit
+        api_core.ida_nalt.get_str_type = original_get_str_type
+        api_core.ida_bytes.get_strlit_contents = original_get_strlit_contents
+        api_core.ida_name.get_ea_name = original_get_ea_name
+
+    assert result == [{"kind": "disasm", "text": "F2 F7 0C 00"}]
