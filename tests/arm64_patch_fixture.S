@@ -1,6 +1,6 @@
 // Minimal AArch64 fixture for patch_asm branch encoding tests.
 // Rebuild example:
-// NDK_BIN="../../tools/android-ndk/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin"
+// NDK_BIN="${ANDROID_NDK_HOME:-/home/bluebird/git/android-ndk/android-ndk-r29}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 // "$NDK_BIN/clang" --target=aarch64-linux-gnu -fuse-ld=lld -nostdlib -no-pie \
 //   -Wl,-m,aarch64linux -Wl,-e,_start arm64_patch_fixture.S -o arm64_patch_fixture.elf
 
