@@ -6,10 +6,13 @@ merged into structuredContent.
 """
 
 import json
+import os
 import sys
 import pathlib
 import unittest
+from contextlib import contextmanager
 from typing import TypedDict
+from unittest.mock import patch
 
 from jsonschema import Draft202012Validator
 
@@ -34,12 +37,21 @@ class _ListResult(TypedDict):
     count: int
 
 
-def _fresh_truncated_server() -> McpServer:
+TRUNCATION_ENV_VALUE = "50000"
+
+
+@contextmanager
+def _truncation_enabled():
+    rpc = load_ida_rpc_module()
+    with patch.dict(os.environ, {rpc.OUTPUT_LIMIT_ENV: TRUNCATION_ENV_VALUE}):
+        yield
+
+
+def _fresh_server() -> McpServer:
     """McpServer with the production truncation middleware (rpc.py) applied."""
     rpc = load_ida_rpc_module()
     srv = rpc.McpServer("truncation-test")
     original = srv.registry.methods["tools/call"]
-    limit = rpc.OUTPUT_LIMIT_MAX_CHARS
 
     def patched(name, arguments=None, _meta=None):
         response = original(name, arguments, _meta)
@@ -47,6 +59,9 @@ def _fresh_truncated_server() -> McpServer:
             return response
         structured = response.get("structuredContent")
         if structured is None:
+            return response
+        limit = rpc._get_output_limit_max_chars()
+        if limit <= 0:
             return response
         serialized = json.dumps(structured)
         if len(serialized) <= limit:
@@ -85,47 +100,54 @@ class TruncationInvariantTests(unittest.TestCase):
         return tool, result
 
     def test_truncation_actually_triggers_on_large_output(self):
-        srv = _fresh_truncated_server()
-        _, result = self._call_large_list_tool(srv)
+        srv = _fresh_server()
+        with _truncation_enabled():
+            _, result = self._call_large_list_tool(srv)
         self.assertIn("_meta", result)
         self.assertIn("ida_mcp", result["_meta"])
 
     def test_truncated_structuredContent_matches_outputSchema(self):
-        srv = _fresh_truncated_server()
-        tool, result = self._call_large_list_tool(srv)
+        srv = _fresh_server()
+        with _truncation_enabled():
+            tool, result = self._call_large_list_tool(srv)
         Draft202012Validator(tool["outputSchema"]).validate(result["structuredContent"])
 
     def test_truncated_response_envelope_is_valid_call_tool_result(self):
-        srv = _fresh_truncated_server()
-        _, result = self._call_large_list_tool(srv)
+        srv = _fresh_server()
+        with _truncation_enabled():
+            _, result = self._call_large_list_tool(srv)
         assert_schema(result, CALL_TOOL_RESULT_SCHEMA)
 
     def test_truncation_metadata_not_inside_structuredContent(self):
         # Regression for #361: underscore-prefixed fields must not leak.
-        srv = _fresh_truncated_server()
-        _, result = self._call_large_list_tool(srv)
+        srv = _fresh_server()
+        with _truncation_enabled():
+            _, result = self._call_large_list_tool(srv)
         leaked = [k for k in result["structuredContent"] if k.startswith("_")]
         self.assertFalse(leaked, f"leaked keys: {leaked}")
 
     def test_truncated_items_do_not_contain_sentinel_dict(self):
         # Regression for e802b32: no {"_truncated": ...} appended to lists.
-        srv = _fresh_truncated_server()
-        _, result = self._call_large_list_tool(srv)
+        srv = _fresh_server()
+        with _truncation_enabled():
+            _, result = self._call_large_list_tool(srv)
         for item in result["structuredContent"].get("items", []):
             with self.subTest(item=item):
                 self.assertEqual(set(item.keys()), {"name", "value"})
 
     def test_download_url_is_valid_looking_url(self):
-        srv = _fresh_truncated_server()
-        _, result = self._call_large_list_tool(srv)
+        srv = _fresh_server()
+        with _truncation_enabled():
+            _, result = self._call_large_list_tool(srv)
         meta = result["_meta"]["ida_mcp"]
         self.assertTrue(meta["output_truncated"])
         self.assertTrue(meta["download_url"].startswith("http://"))
         self.assertIn("/output/", meta["download_url"])
 
     def test_content_text_blocks_are_valid(self):
-        srv = _fresh_truncated_server()
-        _, result = self._call_large_list_tool(srv)
+        srv = _fresh_server()
+        with _truncation_enabled():
+            _, result = self._call_large_list_tool(srv)
         self.assertGreaterEqual(len(result["content"]), 1)
         for block in result["content"]:
             with self.subTest(block=block):
@@ -135,7 +157,7 @@ class TruncationInvariantTests(unittest.TestCase):
 
 class DownloadUrlDerivationOverHttpTests(unittest.TestCase):
     def test_download_url_uses_forwarded_public_base(self):
-        srv = _fresh_truncated_server()
+        srv = _fresh_server()
 
         @srv.tool
         def big_list() -> _ListResult:
@@ -145,7 +167,7 @@ class DownloadUrlDerivationOverHttpTests(unittest.TestCase):
                 "count": 5000,
             }
 
-        with McpHttpTestServer(srv) as harness:
+        with _truncation_enabled(), McpHttpTestServer(srv) as harness:
             status, _, response = harness.post_jsonrpc(
                 "tools/call",
                 {"name": "big_list", "arguments": {}},
@@ -159,7 +181,7 @@ class DownloadUrlDerivationOverHttpTests(unittest.TestCase):
         self.assertTrue(meta["download_url"].startswith("https://mcp.example.com/output/"))
 
     def test_download_url_uses_forwarded_prefix(self):
-        srv = _fresh_truncated_server()
+        srv = _fresh_server()
 
         @srv.tool
         def big_list() -> _ListResult:
@@ -169,7 +191,7 @@ class DownloadUrlDerivationOverHttpTests(unittest.TestCase):
                 "count": 5000,
             }
 
-        with McpHttpTestServer(srv) as harness:
+        with _truncation_enabled(), McpHttpTestServer(srv) as harness:
             status, _, response = harness.post_jsonrpc(
                 "tools/call",
                 {"name": "big_list", "arguments": {}},
@@ -190,8 +212,40 @@ class DownloadUrlDerivationOverHttpTests(unittest.TestCase):
 
 
 class NonTruncatedOutputsUnchangedTests(unittest.TestCase):
+    def test_large_output_has_no_truncation_metadata_by_default(self):
+        srv = _fresh_server()
+
+        @srv.tool
+        def big_list() -> _ListResult:
+            """large list."""
+            return {
+                "items": [{"name": f"n{i}", "value": i} for i in range(5000)],
+                "count": 5000,
+            }
+
+        result = call_rpc(srv, "tools/call", name="big_list", arguments={})
+        self.assertNotIn("ida_mcp", result.get("_meta") or {})
+        self.assertEqual(len(result["structuredContent"]["items"]), 5000)
+
+    def test_invalid_output_limit_env_keeps_large_output_untruncated(self):
+        srv = _fresh_server()
+
+        @srv.tool
+        def big_list() -> _ListResult:
+            """large list."""
+            return {
+                "items": [{"name": f"n{i}", "value": i} for i in range(5000)],
+                "count": 5000,
+            }
+
+        rpc = load_ida_rpc_module()
+        with patch.dict(os.environ, {rpc.OUTPUT_LIMIT_ENV: "invalid"}):
+            result = call_rpc(srv, "tools/call", name="big_list", arguments={})
+        self.assertNotIn("ida_mcp", result.get("_meta") or {})
+        self.assertEqual(len(result["structuredContent"]["items"]), 5000)
+
     def test_small_output_has_no_truncation_metadata(self):
-        srv = _fresh_truncated_server()
+        srv = _fresh_server()
 
         @srv.tool
         def small() -> _ListResult:
@@ -202,7 +256,7 @@ class NonTruncatedOutputsUnchangedTests(unittest.TestCase):
         self.assertNotIn("ida_mcp", result.get("_meta") or {})
 
     def test_small_output_structuredContent_is_exact(self):
-        srv = _fresh_truncated_server()
+        srv = _fresh_server()
 
         @srv.tool
         def small() -> _ListResult:
@@ -225,7 +279,7 @@ class TruncationOverDeeplyNestedDataTests(unittest.TestCase):
         class Outer(TypedDict):
             levels: dict[str, Deep]
 
-        srv = _fresh_truncated_server()
+        srv = _fresh_server()
 
         @srv.tool
         def deep() -> Outer:
@@ -236,7 +290,8 @@ class TruncationOverDeeplyNestedDataTests(unittest.TestCase):
 
         tools = call_rpc(srv, "tools/list")["tools"]
         tool = next(t for t in tools if t["name"] == "deep")
-        result = call_rpc(srv, "tools/call", name="deep", arguments={})
+        with _truncation_enabled():
+            result = call_rpc(srv, "tools/call", name="deep", arguments={})
         Draft202012Validator(tool["outputSchema"]).validate(result["structuredContent"])
 
 

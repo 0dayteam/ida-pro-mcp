@@ -17,10 +17,21 @@ MCP_SERVER = McpServer("ida-pro-mcp", extensions=MCP_EXTENSIONS)
 # Output Size Limiting
 # ============================================================================
 
-OUTPUT_LIMIT_MAX_CHARS = 50000
+OUTPUT_LIMIT_ENV = "IDA_MCP_OUTPUT_LIMIT_MAX_CHARS"
+OUTPUT_LIMIT_MAX_CHARS = 0
 OUTPUT_CACHE_MAX_SIZE = 100
 _output_cache: dict[str, Any] = {}
 _download_base_url: str = os.environ.get("IDA_MCP_URL", "http://127.0.0.1:13337")
+
+
+def _get_output_limit_max_chars() -> int:
+    raw_value = os.environ.get(OUTPUT_LIMIT_ENV)
+    if raw_value is None:
+        return OUTPUT_LIMIT_MAX_CHARS
+    try:
+        return max(0, int(raw_value))
+    except ValueError:
+        return 0
 
 
 def set_download_base_url(url: str) -> None:
@@ -106,8 +117,12 @@ def _install_tools_call_patch() -> None:
         if structured is None:
             return response
 
+        output_limit = _get_output_limit_max_chars()
+        if output_limit <= 0:
+            return response
+
         serialized = json.dumps(structured)
-        if len(serialized) <= OUTPUT_LIMIT_MAX_CHARS:
+        if len(serialized) <= output_limit:
             return response
 
         output_id = _generate_output_id()
