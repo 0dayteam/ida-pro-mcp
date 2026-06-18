@@ -23,8 +23,6 @@ from .utils import (
     normalize_list_input,
 )
 
-# Max decompile lines before truncation.
-_DECOMPILE_LINE_CAP = 100
 # Max strings/constants returned in compact mode.
 _TOP_STRINGS = 10
 _TOP_CONSTANTS = 10
@@ -43,7 +41,6 @@ class AnalyzeFunctionResult(TypedDict, total=False):
     prototype: str | None
     size: int
     decompiled: str | None
-    decompile_truncated: int
     assembly: str | None
     strings: list[str]
     constants: list[dict[str, Any]]
@@ -176,19 +173,6 @@ def _filter_constants(raw: list[dict], limit: int = _TOP_CONSTANTS) -> list[dict
     return out[:limit]
 
 
-def _cap_decompile(code: str | None) -> tuple[str | None, int | None]:
-    """Cap decompiled output at _DECOMPILE_LINE_CAP lines.
-    Returns (possibly_truncated_code, total_lines_or_None)."""
-    if code is None:
-        return None, None
-    lines = code.split("\n")
-    total = len(lines)
-    if total <= _DECOMPILE_LINE_CAP:
-        return code, None  # not truncated
-    truncated = "\n".join(lines[:_DECOMPILE_LINE_CAP])
-    return truncated, total
-
-
 def _compact_strings(raw: list[dict], limit: int = _TOP_STRINGS) -> list[str]:
     """Return just the string values, deduplicated, capped at limit."""
     seen: set[str] = set()
@@ -213,7 +197,7 @@ def _analyze_function_internal(
 ) -> AnalyzeFunctionResult:
     """Core analysis logic — must be called from an @idasync context.
 
-    Returns a compact response by default: decompilation capped at 100 lines,
+    Returns a compact response by default: full decompilation,
     top 10 strings as values only, top 10 non-trivial constants, no disassembly.
     Pass include_asm=True to include full disassembly."""
     import idaapi
@@ -230,13 +214,9 @@ def _analyze_function_internal(
         result["prototype"] = get_prototype(func)
         result["size"] = func.end_ea - func.start_ea
 
-        # Decompilation — capped at _DECOMPILE_LINE_CAP lines.
+        # Decompilation.
         try:
-            raw_code = decompile_function_safe(ea)
-            code, total_lines = _cap_decompile(raw_code)
-            result["decompiled"] = code
-            if total_lines is not None:
-                result["decompile_truncated"] = total_lines
+            result["decompiled"] = decompile_function_safe(ea)
         except Exception:
             result["decompiled"] = None
 
